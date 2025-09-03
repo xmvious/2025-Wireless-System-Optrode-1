@@ -59,7 +59,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ---- 상단 컨트롤 영역 ----
         ctrl = QtWidgets.QHBoxLayout()
 
-        # 🔹 포트 선택 콤보박스 추가
+        # 포트 선택 콤보박스 추가
         ctrl.addWidget(QtWidgets.QLabel("Port"))
         self.port_combo = QtWidgets.QComboBox()
         ports = [p.device for p in list_ports.comports()]
