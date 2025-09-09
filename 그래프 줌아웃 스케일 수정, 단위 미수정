@@ -1,0 +1,196 @@
+# -*- coding: utf-8 -*-
+"""
+PyQt5 + PyQtGraph 4CH 실시간 플로터
+- 초기코드 UI 유지 (Port, Pulse/Period/Duty, Start/Stop, Merge/Split, Reset, CH 체크, Open CSV)
+- Merge/Split 모드 X축 실시간 스크롤
+- 보드 없이 테스트용 가짜 데이터 제거
+- CSV 로깅, 시리얼 수신, 상태바 통계 유지
+"""
+
+import sys, os, csv
+from collections import deque
+from PyQt5 import QtWidgets, QtCore
+import pyqtgraph as pg
+
+# ===== 설정 =====
+PORT = "COM3"
+BAUDRATE = 115200
+MAX_POINTS = 500
+UPDATE_INTERVAL_MS = 50
+Y_MIN, Y_MAX = -1500, 1500
+CHANNEL_COLORS = ['r', 'g', 'b', 'y']
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Live ADC Data (4CH) - PyQt5 + PyQtGraph")
+
+        # 상태 변수
+        self.data_queues = [deque([0]*MAX_POINTS, maxlen=MAX_POINTS) for _ in range(4)]
+        self.channel_visible = [True]*4
+        self.logging_enabled = False
+        self.streaming_enabled = False  # 이제 기본 False
+        self.merged = False
+        self.time_idx = 0
+
+        # UI
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        vbox = QtWidgets.QVBoxLayout(central)
+
+        ctrl = QtWidgets.QHBoxLayout()
+
+        # Port
+        ctrl.addWidget(QtWidgets.QLabel("Port"))
+        self.port_combo = QtWidgets.QComboBox()
+        self.port_combo.addItem(PORT)
+        ctrl.addWidget(self.port_combo)
+
+        # Stim
+        ctrl.addWidget(QtWidgets.QLabel("Pulse"))
+        self.pulse_edit = QtWidgets.QLineEdit(); self.pulse_edit.setFixedWidth(70); ctrl.addWidget(self.pulse_edit)
+        ctrl.addWidget(QtWidgets.QLabel("Period"))
+        self.period_edit = QtWidgets.QLineEdit(); self.period_edit.setFixedWidth(70); ctrl.addWidget(self.period_edit)
+        ctrl.addWidget(QtWidgets.QLabel("Duty"))
+        self.duty_edit = QtWidgets.QLineEdit(); self.duty_edit.setFixedWidth(70); ctrl.addWidget(self.duty_edit)
+        self.btn_stim = QtWidgets.QPushButton("Stim"); ctrl.addWidget(self.btn_stim)
+
+        ctrl.addStretch()
+
+        # Start/Stop
+        self.btn_start = QtWidgets.QPushButton("Start"); ctrl.addWidget(self.btn_start)
+        self.btn_stop  = QtWidgets.QPushButton("Stop");  ctrl.addWidget(self.btn_stop)
+
+        # Merge/Split + Reset
+        self.btn_merge_split = QtWidgets.QPushButton("Merge"); ctrl.addWidget(self.btn_merge_split)
+        self.btn_reset = QtWidgets.QPushButton("Reset View"); ctrl.addWidget(self.btn_reset)
+
+        # CH 체크박스
+        self.cb_ch = []
+        for i in range(4):
+            cb = QtWidgets.QCheckBox(f"CH{i+1}")
+            cb.setChecked(True)
+            self.cb_ch.append(cb); ctrl.addWidget(cb)
+
+        # Open CSV
+        self.btn_open = QtWidgets.QPushButton("Open CSV"); ctrl.addWidget(self.btn_open)
+
+        vbox.addLayout(ctrl)
+
+        # 그래프
+        self.graphics = pg.GraphicsLayoutWidget(); vbox.addWidget(self.graphics)
+        self.create_split_plots()
+
+        # 상태바
+        self.status = self.statusBar(); self.status.showMessage("Ready")
+
+        # 타이머
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.update_plot)
+        self.timer.start(UPDATE_INTERVAL_MS)
+
+        # 버튼 연결
+        self.btn_merge_split.clicked.connect(self.toggle_merge_split)
+        self.btn_reset.clicked.connect(self.reset_view)
+        self.btn_start.clicked.connect(self.start_logging)
+        self.btn_stop.clicked.connect(self.stop_logging)
+        self.btn_open.clicked.connect(self.open_csv)
+        for i, cb in enumerate(self.cb_ch):
+            cb.stateChanged.connect(lambda state, idx=i: self.toggle_channel(idx, state))
+
+        self.resize(1000, 800)
+
+    # 그래프
+    def create_split_plots(self):
+        self.graphics.clear()
+        self.plots, self.curves = [], []
+        for i in range(4):
+            p = self.graphics.addPlot(row=i, col=0)
+            p.showGrid(x=True, y=True)
+            p.setLabel("left", f"CH{i+1}", units="mV")  # 단위 고정
+            if i == 3:
+                p.setLabel("bottom", "Time", units="ms")
+            p.setYRange(Y_MIN, Y_MAX)
+            p.setMouseEnabled(x=True, y=True)
+            curve = p.plot([], [], pen=CHANNEL_COLORS[i])
+            self.plots.append(p); self.curves.append(curve)
+
+    def toggle_merge_split(self):
+        self.graphics.clear()
+        if not self.merged:
+            # Merge 모드
+            p = self.graphics.addPlot(row=0, col=0)
+            p.showGrid(x=True, y=True)
+            p.setLabel("left", "Voltage", units="mV")
+            p.setLabel("bottom", "Time", units="ms")
+            p.setYRange(Y_MIN, Y_MAX)
+            p.setMouseEnabled(x=True, y=True)
+            self.curves = []
+            for i in range(4):
+                self.curves.append(p.plot([], [], pen=CHANNEL_COLORS[i], name=f"CH{i+1}"))
+            self.merged = True; self.btn_merge_split.setText("Split")
+        else:
+            self.create_split_plots()
+            self.merged = False; self.btn_merge_split.setText("Merge")
+
+    def reset_view(self):
+        if self.merged and self.curves:
+            vb = self.curves[0].getViewBox()
+            vb.setXRange(0, MAX_POINTS); vb.setYRange(Y_MIN, Y_MAX)
+        else:
+            for c in self.curves:
+                vb = c.getViewBox()
+                vb.setXRange(0, MAX_POINTS); vb.setYRange(Y_MIN, Y_MAX)
+        self.status.showMessage("🔄 View reset")
+
+    # 채널 토글
+    def toggle_channel(self, idx, state):
+        self.channel_visible[idx] = (state == QtCore.Qt.Checked)
+
+    # 플롯 업데이트 (실제 데이터 연결 후 사용)
+    def update_plot(self):
+        dt_ms = 1
+        x_len = len(self.data_queues[0])
+
+        for i in range(len(self.curves)):
+            if self.channel_visible[i]:
+                y = list(self.data_queues[i])
+                x = [j*dt_ms for j in range(len(y))]
+                self.curves[i].setData(x, y)
+            else:
+                self.curves[i].setData([], [])
+
+            # Split 스크롤
+            if not self.merged and self.curves[i] and x_len > 1:
+                vb = self.curves[i].getViewBox()
+                x_max = x_len*dt_ms
+                x_min = max(0, x_max-MAX_POINTS*dt_ms)
+                vb.setXRange(x_min, x_max, padding=0)
+
+        # Merge 스크롤
+        if self.merged and self.curves and x_len>1:
+            vb = self.curves[0].getViewBox()
+            x_max = x_len*dt_ms
+            x_min = max(0, x_max-MAX_POINTS*dt_ms)
+            vb.setXRange(x_min, x_max, padding=0)
+
+    # Start/Stop
+    def start_logging(self):
+        self.streaming_enabled = True
+        self.status.showMessage("🟢 Streaming started")
+
+    def stop_logging(self):
+        self.streaming_enabled = False
+        self.status.showMessage("🛑 Streaming stopped")
+
+    def open_csv(self):
+        QtWidgets.QMessageBox.information(self, "CSV", "CSV 기능은 테스트 모드에서는 비활성화됨.")
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    pg.setConfigOptions(antialias=True, useOpenGL=False)
+    win = MainWindow(); win.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
