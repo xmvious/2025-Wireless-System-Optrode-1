@@ -1,0 +1,378 @@
+/*
+ * Peripheral NUS (Binary+Framing) + SAADC EasyDMA streaming (HAL only)
+ * NCS v2.9.0 / Zephyr 3.7.x
+ */
+
+#include <errno.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <zephyr/kernel.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/types.h>
+
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/hci.h>
+#include <bluetooth/services/nus.h>
+
+#include <zephyr/settings/settings.h>
+#include <zephyr/logging/log.h>
+#include <dk_buttons_and_leds.h>
+
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/util.h>
+
+/* HAL / nrfx */
+#include <hal/nrf_gpio.h>
+#include <hal/nrf_saadc.h>
+#include <hal/nrf_timer.h>
+#include <hal/nrf_ppi.h>
+#include <nrfx_timer.h>
+#include <nrfx_ppi.h>
+
+LOG_MODULE_REGISTER(peripheral_uart, LOG_LEVEL_INF);
+
+/* ================= Frame ================= */
+#define FRAME_MAGIC 0xA5C3
+typedef struct __packed {
+    uint16_t magic;
+    uint16_t seq;
+    uint16_t payload_len;
+    uint8_t  ch_mask;
+    uint8_t  flags;
+} frame_hdr_t;
+
+#define DEFAULT_CH_MASK    0x0F
+#define FLAG_ASCII_PAYLOAD 0x01
+
+static uint16_t att_mtu = 23;
+static inline uint16_t nus_max_chunk(void){ return (att_mtu > 3) ? (att_mtu - 3) : 20; }
+
+/* 광고/스캔 응답은 전역 정적 초기화로 유지 */
+static const struct bt_data ad[] = {
+    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+    BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME)-1),
+};
+static const struct bt_data sd[] = {
+    BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
+};
+
+static struct bt_conn *current_conn;
+static K_SEM_DEFINE(nus_write_sem, 0, 1);
+
+static inline void update_mtu_from_conn(struct bt_conn *c){
+    if (!c) {
+        return;
+    }
+    uint16_t m = bt_gatt_get_mtu(c);
+    if (m >= 23) {
+        att_mtu = m;
+    }
+}
+
+static void nus_sent_cb(struct bt_conn *conn){ ARG_UNUSED(conn); k_sem_give(&nus_write_sem); }
+
+static int nus_send_chunked(const uint8_t *p, uint16_t len){
+    while(len){
+        uint16_t n = MIN(nus_max_chunk(), len);
+        int err = bt_nus_send(current_conn, p, n);
+        if(err) return err;
+        if (k_sem_take(&nus_write_sem, K_MSEC(150))) { LOG_WRN("NUS send timeout"); }
+        p+=n; len-=n;
+    }
+    return 0;
+}
+
+static int send_frame_over_nus(const uint8_t *payload, uint16_t payload_len,
+                               uint8_t ch_mask, uint8_t flags){
+    if(!current_conn) return -ENOTCONN;
+    const uint16_t total = sizeof(frame_hdr_t)+payload_len;
+    uint8_t *frame = k_malloc(total);
+    if(!frame) return -ENOMEM;
+    static uint16_t seq=0;
+    frame_hdr_t hdr = {
+        .magic       = sys_cpu_to_le16(FRAME_MAGIC),
+        .seq         = sys_cpu_to_le16(seq++),
+        .payload_len = sys_cpu_to_le16(payload_len),
+        .ch_mask     = ch_mask,
+        .flags       = flags,
+    };
+    memcpy(frame, &hdr, sizeof(hdr));
+    memcpy(frame+sizeof(hdr), payload, payload_len);
+    update_mtu_from_conn(current_conn);
+    int err = nus_send_chunked(frame, total);
+    k_free(frame);
+    return err;
+}
+
+/* ================= SAADC (HAL only) ================= */
+/* 채널/속도/버퍼 */
+#define NUM_CHANNELS                 4
+#define CH_SPS                       16000        /* per-channel */
+#define SAADC_SAMPLE_RATE            (CH_SPS*NUM_CHANNELS)
+
+#define SAMPLES_PER_CH_BLOCK         64           /* DMA 블럭당 채널샘플 수 */
+#define BUF_TOTAL_SAMPLES            (SAMPLES_PER_CH_BLOCK*NUM_CHANNELS)
+
+/* EasyDMA 버퍼 (int16_t) */
+static int16_t buf_a[BUF_TOTAL_SAMPLES];
+static int16_t buf_b[BUF_TOTAL_SAMPLES];
+static int16_t *cur_buf  = buf_a;
+static int16_t *next_buf = buf_b;
+
+static volatile int active_buf = 0;
+
+static const nrf_saadc_input_t inputs[NUM_CHANNELS] = {
+    NRF_SAADC_INPUT_AIN2, NRF_SAADC_INPUT_AIN4, NRF_SAADC_INPUT_AIN5, NRF_SAADC_INPUT_AIN6
+};
+
+/* TIMER1 + PPI */
+static const nrfx_timer_t m_timer = NRFX_TIMER_INSTANCE(1);
+static nrf_ppi_channel_t m_ppi_ch;
+
+/* 이벤트 큐 & 워커 */
+struct adc_block_evt { int buf_id; size_t count; };
+K_MSGQ_DEFINE(adc_evt_q, sizeof(struct adc_block_evt), 4, 4);
+static void adc_send_worker(struct k_work *w);
+K_WORK_DEFINE(adc_work_send, adc_send_worker);
+
+/* ISR */
+void SAADC_IRQHandler(void)
+{
+    /* END event: Result buffer가 가득 찼을 때 */
+    if (nrf_saadc_event_check(NRF_SAADC, NRF_SAADC_EVENT_END)) {
+        nrf_saadc_event_clear(NRF_SAADC, NRF_SAADC_EVENT_END);
+
+        /* 완료된 버퍼는 active_buf의 반대 */
+        int done_id = active_buf ^ 1;
+        struct adc_block_evt ev = { .buf_id = done_id, .count = BUF_TOTAL_SAMPLES };
+        (void)k_msgq_put(&adc_evt_q, &ev, K_NO_WAIT);
+
+        /* 버퍼 스왑 */
+        active_buf ^= 1;
+        cur_buf  = (active_buf == 0) ? buf_a : buf_b;
+        next_buf = (active_buf == 0) ? buf_b : buf_a;
+
+        /* 다음 캡처용 버퍼 연결 (PTR + MAXCNT) */
+        nrf_saadc_buffer_init(NRF_SAADC, (nrf_saadc_value_t *)cur_buf, BUF_TOTAL_SAMPLES);
+
+        (void)k_work_submit(&adc_work_send);
+    }
+
+    /* 참고: nRF52840 SAADC에는 별도 OVRFLW 이벤트/INT 없음 */
+}
+
+static void saadc_configure_channels(void)
+{
+    for (uint8_t ch=0; ch<NUM_CHANNELS; ch++){
+        /* 채널 공통 설정 */
+        nrf_saadc_channel_config_t cfg = {
+            .resistor_p = NRF_SAADC_RESISTOR_DISABLED,
+            .resistor_n = NRF_SAADC_RESISTOR_DISABLED,
+            .gain       = NRF_SAADC_GAIN1_6,
+            .reference  = NRF_SAADC_REFERENCE_VDD4,
+            .acq_time   = NRF_SAADC_ACQTIME_10US,
+            .mode       = NRF_SAADC_MODE_SINGLE_ENDED,
+            .burst      = NRF_SAADC_BURST_DISABLED,
+        };
+        /* 채널 config write */
+        nrf_saadc_channel_init(NRF_SAADC, ch, &cfg);
+        /* 입력 핀 연결 */
+        nrf_saadc_channel_input_set(NRF_SAADC, ch, inputs[ch], NRF_SAADC_INPUT_DISABLED);
+    }
+}
+
+static int saadc_stream_start(void)
+{
+    /* SAADC 기본설정 */
+    nrf_saadc_disable(NRF_SAADC);
+    nrf_saadc_resolution_set(NRF_SAADC, NRF_SAADC_RESOLUTION_12BIT);
+    nrf_saadc_oversample_set(NRF_SAADC, NRF_SAADC_OVERSAMPLE_DISABLED);
+    saadc_configure_channels();
+
+    /* 결과 버퍼 준비: EasyDMA (첫 버퍼 연결) */
+    active_buf = 0;
+    cur_buf  = buf_a;
+    next_buf = buf_b;
+    nrf_saadc_buffer_init(NRF_SAADC, (nrf_saadc_value_t *)cur_buf, BUF_TOTAL_SAMPLES);
+
+    nrf_saadc_enable(NRF_SAADC);
+
+    /* 인터럽트: END */
+    nrf_saadc_int_enable (NRF_SAADC, NRF_SAADC_INT_END);
+    NRFX_IRQ_PRIORITY_SET(SAADC_IRQn, NRFX_SAADC_DEFAULT_CONFIG_IRQ_PRIORITY);
+    NRFX_IRQ_ENABLE(SAADC_IRQn);
+
+    /* START kick */
+    nrf_saadc_task_trigger(NRF_SAADC, NRF_SAADC_TASK_START);
+
+    /* TIMER1 = SAADC SAMPLE 트리거 */
+    nrfx_timer_config_t tcfg = {
+        .frequency          = NRF_TIMER_FREQ_16MHz,
+        .mode               = NRF_TIMER_MODE_TIMER,
+        .bit_width          = NRF_TIMER_BIT_WIDTH_32,
+        .interrupt_priority = NRFX_TIMER_DEFAULT_CONFIG_IRQ_PRIORITY,
+        .p_context          = NULL,
+    };
+    if (nrfx_timer_init(&m_timer, &tcfg, NULL) != NRFX_SUCCESS) {
+        LOG_ERR("timer init failed");
+        return -EIO;
+    }
+    uint32_t period_us = 1000000UL / SAADC_SAMPLE_RATE; /* 총 샘플링 주기(채널 합) */
+    uint32_t ticks = nrfx_timer_us_to_ticks(&m_timer, period_us);
+    nrfx_timer_extended_compare(&m_timer, NRF_TIMER_CC_CHANNEL0, ticks,
+                                NRF_TIMER_SHORT_COMPARE0_CLEAR_MASK, false);
+
+    /* PPI: TIMER1 COMPARE0 -> SAADC SAMPLE */
+    uint32_t ev_addr   = nrfx_timer_compare_event_address_get(&m_timer, NRF_TIMER_CC_CHANNEL0);
+    uint32_t task_addr = nrf_saadc_task_address_get(NRF_SAADC, NRF_SAADC_TASK_SAMPLE);
+
+    if (nrfx_ppi_channel_alloc(&m_ppi_ch) != NRFX_SUCCESS) { LOG_ERR("ppi alloc"); return -EIO; }
+    if (nrfx_ppi_channel_assign(m_ppi_ch, ev_addr, task_addr) != NRFX_SUCCESS){ LOG_ERR("ppi assign"); return -EIO; }
+    if (nrfx_ppi_channel_enable(m_ppi_ch) != NRFX_SUCCESS){ LOG_ERR("ppi enable"); return -EIO; }
+
+    nrfx_timer_enable(&m_timer);
+
+    LOG_INF("SAADC stream ON: %dch @%d sps/ch, buf=%d samp",
+            NUM_CHANNELS, CH_SPS, BUF_TOTAL_SAMPLES);
+    return 0;
+}
+
+static void saadc_stream_stop(void)
+{
+    nrfx_timer_disable(&m_timer);
+    (void)nrfx_ppi_channel_disable(m_ppi_ch);
+
+    nrf_saadc_int_disable(NRF_SAADC, NRF_SAADC_INT_END);
+    NRFX_IRQ_DISABLE(SAADC_IRQn);
+
+    nrf_saadc_task_trigger(NRF_SAADC, NRF_SAADC_TASK_STOP);
+    nrf_saadc_disable(NRF_SAADC);
+
+    LOG_INF("SAADC stream OFF");
+}
+
+/* payload pack & send */
+#define SAMPLES_PER_FRAME_PER_CH 32
+#define FRAME_SAMPLES_TOTAL      (SAMPLES_PER_FRAME_PER_CH*NUM_CHANNELS)
+
+static void adc_send_worker(struct k_work *w)
+{
+    ARG_UNUSED(w);
+    struct adc_block_evt ev;
+    while (k_msgq_get(&adc_evt_q, &ev, K_NO_WAIT)==0){
+        int16_t *src = (ev.buf_id==0)? buf_a : buf_b;
+        size_t pos=0, n = ev.count; /* int16 count */
+        while (pos<n){
+            size_t chunk = MIN((size_t)FRAME_SAMPLES_TOTAL, n-pos);
+            uint16_t payload_len = (uint16_t)(chunk * sizeof(int16_t));
+            int e = send_frame_over_nus((uint8_t*)&src[pos], payload_len, DEFAULT_CH_MASK, 0x00);
+            if(e){ LOG_WRN("BLE send err=%d", e); }
+            pos += chunk;
+        }
+    }
+}
+
+/* ================= BLE RX (ASCII on/off + pulse,period,duty) ================= */
+#define GPIO_PIN NRF_GPIO_PIN_MAP(0,3)
+
+static void handle_ascii_command(const char *s)
+{
+    nrf_gpio_cfg_output(GPIO_PIN);
+
+    if (strchr(s, ',') != NULL) {
+        int pulse=0, period=0, duty=0;
+        char buf[128]; size_t n=MIN(sizeof(buf)-1, strlen(s));
+        memcpy(buf,s,n); buf[n]='\0';
+        char *t=strtok(buf,","); if(t){ pulse=atoi(t); t=strtok(NULL,","); }
+        if(t){ period=atoi(t); t=strtok(NULL,","); }
+        if(t){ duty=atoi(t); }
+        const float unit=0.3125f;
+        int on_ms=(int)(duty*unit), off_ms=(int)((period-duty)*unit);
+        for(int i=0;i<pulse;i++){ nrf_gpio_pin_write(GPIO_PIN,1); k_msleep(on_ms);
+                                  nrf_gpio_pin_write(GPIO_PIN,0); k_msleep(off_ms);}
+        return;
+    }
+
+    if (!strncmp(s,"on",2)) {
+        (void)saadc_stream_start();
+    } else if (!strncmp(s,"off",3)) {
+        saadc_stream_stop();
+    }
+}
+
+static void handle_payload_to_uart(const uint8_t *data, uint16_t len){
+    ARG_UNUSED(data); ARG_UNUSED(len);
+}
+
+static void bt_receive_cb(struct bt_conn *conn, const uint8_t *const data, uint16_t len)
+{
+    update_mtu_from_conn(conn);
+    if (len>=sizeof(frame_hdr_t)){
+        frame_hdr_t hdr; memcpy(&hdr,data,sizeof(hdr));
+        uint16_t magic=sys_le16_to_cpu(hdr.magic), plen=sys_le16_to_cpu(hdr.payload_len);
+        if (magic==FRAME_MAGIC && (sizeof(hdr)+plen)<=len){
+            const uint8_t *payload=data+sizeof(hdr);
+            if (hdr.flags & FLAG_ASCII_PAYLOAD){
+                char tmp[256]; size_t n=MIN(sizeof(tmp)-1,(size_t)plen);
+                memcpy(tmp,payload,n); tmp[n]='\0'; handle_ascii_command(tmp);
+            }else{
+                handle_payload_to_uart(payload, plen);
+            }
+            return;
+        }
+    }
+    char tmp[256]; size_t n=MIN(sizeof(tmp)-1,(size_t)len);
+    memcpy(tmp,data,n); tmp[n]='\0'; handle_ascii_command(tmp);
+}
+
+static struct bt_nus_cb nus_cb = {
+    .received = bt_receive_cb,
+    .sent     = nus_sent_cb,
+};
+
+/* ================= BLE conn callbacks ================= */
+static void connected(struct bt_conn *conn, uint8_t err){
+    if(err){ LOG_ERR("conn failed 0x%02x %s", err, bt_hci_err_to_str(err)); return; }
+    current_conn = bt_conn_ref(conn);
+    update_mtu_from_conn(conn);
+    LOG_INF("Connected");
+}
+static void disconnected(struct bt_conn *conn, uint8_t reason){
+    LOG_INF("Disconnected: 0x%02x %s", reason, bt_hci_err_to_str(reason));
+    if(current_conn){ bt_conn_unref(current_conn); current_conn=NULL; }
+    saadc_stream_stop();
+}
+BT_CONN_CB_DEFINE(conn_cb) = { .connected=connected, .disconnected=disconnected };
+
+/* ================= Main ================= */
+static void configure_gpio(void){
+    if (dk_leds_init()) LOG_WRN("LED init fail");
+}
+
+int main(void)
+{
+    configure_gpio();
+
+    if (bt_enable(NULL)) { LOG_ERR("BT init fail"); return 0; }
+    LOG_INF("Bluetooth initialized");
+
+    if (IS_ENABLED(CONFIG_SETTINGS)) settings_load();
+
+    if (bt_nus_init(&nus_cb)) { LOG_ERR("NUS init fail"); return 0; }
+
+    if (bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd))) {
+        LOG_ERR("Adv start fail"); return 0;
+    }
+    LOG_INF("Advertising started");
+
+    while (1){
+        dk_set_led(DK_LED1, 1); k_sleep(K_MSEC(50));
+        dk_set_led(DK_LED1, 0); k_sleep(K_MSEC(950));
+    }
+    return 0;
+}
