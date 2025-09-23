@@ -377,37 +377,48 @@ static int send_frame_over_nus(const uint8_t *payload, uint16_t payload_len, uin
 }
 
 /* =====================[ SAADC 세부: 채널 설정 & 핸들러 ]===================== */
-// 이 함수 전체를 아래 내용으로 바꿔주세요.
+// 이 함수를 아래의 최종 코드로 교체해주세요.
 static void saadc_channels_init(uint8_t ch_mask)
 {
-    // 1. 설정 구조체를 0으로 초기화합니다.
-    nrf_saadc_channel_config_t ch_cfg = {0};
+    // 1. 설정할 채널들을 담을 배열을 선언합니다.
+    nrfx_saadc_channel_t channels[NUM_CHANNELS];
+    uint8_t ch_count = 0;
 
-    // 2. 공통 설정을 채웁니다. (이전 방식과 유사)
-    ch_cfg.gain       = NRF_SAADC_GAIN1_4;
-    ch_cfg.reference  = NRF_SAADC_REFERENCE_INTERNAL; /* 0.6V ref, gain 1/4 → ~2.4V FS */
-    ch_cfg.acq_time   = NRF_SAADC_ACQTIME_10US;
-    ch_cfg.mode       = NRF_SAADC_MODE_SINGLE_ENDED; // SE 모드 명시
-    ch_cfg.burst      = NRF_SAADC_BURST_DISABLED;    // 버스트 모드 비활성화
+    // 2. 공통으로 사용할 '내부' 채널 설정을 정의합니다.
+    nrf_saadc_channel_config_t common_channel_config = {
+        .gain       = NRF_SAADC_GAIN1_4,
+        .reference  = NRF_SAADC_REFERENCE_INTERNAL,
+        .acq_time   = NRF_SAADC_ACQTIME_10US,
+        .mode       = NRF_SAADC_MODE_SINGLE_ENDED,
+        .burst      = NRF_SAADC_BURST_DISABLED,
+        // pselp는 여기서 설정하지 않습니다.
+    };
 
-    int ch_index = 0;
-
-    // 3. 각 채널에 대해 핀을 설정하고, nrfx_saadc_channel_config_set으로 적용합니다.
+    // 3. 활성화된 마스크에 따라 채널 배열을 채웁니다.
     if (ch_mask & 0x01) {
-        nrf_saadc_channel_pos_input_set(&ch_cfg, AIN0);
-        NRFX_ASSERT(nrfx_saadc_channel_config_set(ch_index++, &ch_cfg) == NRFX_SUCCESS);
+        channels[ch_count].pin_p          = AIN0; // 핀은 바깥 구조체에 직접 설정
+        channels[ch_count].channel_config = common_channel_config; // 내부 설정은 통째로 복사
+        ch_count++;
     }
     if (ch_mask & 0x02) {
-        nrf_saadc_channel_pos_input_set(&ch_cfg, AIN1);
-        NRFX_ASSERT(nrfx_saadc_channel_config_set(ch_index++, &ch_cfg) == NRFX_SUCCESS);
+        channels[ch_count].pin_p          = AIN1;
+        channels[ch_count].channel_config = common_channel_config;
+        ch_count++;
     }
     if (ch_mask & 0x04) {
-        nrf_saadc_channel_pos_input_set(&ch_cfg, AIN2);
-        NRFX_ASSERT(nrfx_saadc_channel_config_set(ch_index++, &ch_cfg) == NRFX_SUCCESS);
+        channels[ch_count].pin_p          = AIN2;
+        channels[ch_count].channel_config = common_channel_config;
+        ch_count++;
     }
     if (ch_mask & 0x08) {
-        nrf_saadc_channel_pos_input_set(&ch_cfg, AIN3);
-        NRFX_ASSERT(nrfx_saadc_channel_config_set(ch_index++, &ch_cfg) == NRFX_SUCCESS);
+        channels[ch_count].pin_p          = AIN3;
+        channels[ch_count].channel_config = common_channel_config;
+        ch_count++;
+    }
+
+    // 4. 채널 배열과 개수를 넘겨 모든 채널을 한 번에 설정합니다.
+    if (ch_count > 0) {
+        NRFX_ASSERT(nrfx_saadc_channels_config(channels, ch_count) == NRFX_SUCCESS);
     }
 
     /* 더블버퍼 설정은 동일합니다. */
