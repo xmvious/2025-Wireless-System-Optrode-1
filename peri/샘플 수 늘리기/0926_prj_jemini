@@ -1,0 +1,86 @@
+# ===================================================================
+# prj.conf for High-Performance Peripheral NUS SAADC Streaming
+# - Optimized for nrfx HAL drivers (SAADC, TIMER, PPI)
+# - UART logging enabled for easy debugging via serial terminal
+# ===================================================================
+
+#
+# Kernel & System Resources (대용량 버퍼 사용을 위해 넉넉하게 설정)
+#
+CONFIG_HEAP_MEM_POOL_SIZE=8192
+CONFIG_MAIN_STACK_SIZE=4096
+CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE=2048
+
+#
+# Logging & Console (디버그 메시지를 시리얼 터미널에서 보기 위한 설정)
+#
+CONFIG_SERIAL=y
+CONFIG_CONSOLE=y
+CONFIG_UART_CONSOLE=y          # UART를 콘솔로 사용
+CONFIG_LOG=y
+CONFIG_LOG_BACKEND_UART=y      # 로그 출력을 UART로 지정
+CONFIG_LOG_PRINTK=y            # printk() 함수도 로그 시스템을 통해 출력
+CONFIG_LOG_MODE_IMMEDIATE=y    # 로그를 버퍼링 없이 즉시 출력
+CONFIG_USE_SEGGER_RTT=n        # RTT 비활성화
+CONFIG_LOG_BACKEND_RTT=n       # RTT 백엔드 비활성화
+
+#
+# Drivers & Libraries
+#
+CONFIG_GPIO=y
+CONFIG_DK_LIBRARY=y
+
+#
+# Bluetooth Stack (Peripheral Role)
+#
+CONFIG_BT=y
+CONFIG_BT_PERIPHERAL=y
+CONFIG_BT_DEVICE_NAME="Nordic_NUS_SAADC"
+CONFIG_BT_MAX_CONN=1
+
+#
+# Bluetooth: NUS (Nordic UART Service)
+#
+CONFIG_BT_NUS=y
+
+#
+# Bluetooth: Bonding & Settings
+#
+CONFIG_BT_SETTINGS=y
+CONFIG_BT_MAX_PAIRED=1
+CONFIG_FLASH=y
+CONFIG_FLASH_PAGE_LAYOUT=y
+CONFIG_FLASH_MAP=y
+CONFIG_NVS=y
+
+#
+# Bluetooth: High Throughput Optimizations (고속 전송 최적화)
+#
+CONFIG_BT_PHY_UPDATE=y
+CONFIG_BT_CTLR_PHY_2M=y
+CONFIG_BT_DATA_LEN_UPDATE=y
+CONFIG_BT_CTLR_DATA_LENGTH_MAX=251
+CONFIG_BT_L2CAP_TX_MTU=247
+CONFIG_BT_BUF_ACL_TX_SIZE=251
+CONFIG_BT_BUF_ACL_RX_SIZE=251
+CONFIG_BT_BUF_ACL_TX_COUNT=10
+CONFIG_BT_BUF_ACL_RX_COUNT=10
+CONFIG_BT_RX_STACK_SIZE=4096
+
+#
+# Hardware Acceleration Drivers (nrfx HAL for SAADC DMA)
+#
+CONFIG_ADC=y
+CONFIG_NRFX_SAADC=y
+CONFIG_NRFX_TIMER1=y
+CONFIG_NRFX_PPI=y
+
+#
+# Power Management (DMA 샘플링 간섭 방지)
+#
+CONFIG_PM_DEVICE_RUNTIME=n
+
+#
+# Debugging
+#
+CONFIG_ASSERT=y
