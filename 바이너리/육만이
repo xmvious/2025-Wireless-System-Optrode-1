@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-PyQt5 + PyQtGraph 기반 4채널 실시간 플로터 (실제 시간 축 적용)
+PyQt5 + PyQtGraph 기반 4채널 실시간 플로터 (Binary Frame + CSV 호환)
 - 기본 입력: 바이너리 프레임
   header: 0xC3 0xA5 | seq(LE16) | payload_len(LE16) | ch_mask(u8) | flags(u8)
-  payload: int16 LE × 4 (CH1..CH4)  [필요시 확장 가능]
+  payload: int16 LE × N (인터리브: ch0,ch1,.. 반복)
 - 하위호환: "v1,v2,v3,v4\n" 또는 "seq,v1,v2,v3,v4\n" 문자열도 파싱
 - Start: 'on\n' 전송 + CSV 로깅 시작 (CSV 헤더: SEQ,CH1..CH4)
 - Stop : 'off\n' 전송 + CSV 로깅 종료
@@ -18,7 +18,6 @@ import os
 import csv
 import struct
 import threading
-import time # <<< 수정: time 모듈 추가
 from threading import Lock
 from collections import deque
 from datetime import datetime
@@ -31,34 +30,34 @@ import pyqtgraph as pg
 from PyQt5 import QtWidgets, QtCore
 
 # ===== 설정 =====
-PORT = "COM3"             # 초기 선택용 기본 포트
-BAUDRATE = 115200         # 권장: 1_000_000 이상 (보드/드라이버 가능 시)
+PORT = "COM3"              # 초기 선택용 기본 포트
+BAUDRATE = 115200          # 권장: 1_000_000 이상 (보드/드라이버 가능 시)
 MAX_POINTS = 500
 UPDATE_INTERVAL_MS = 100
-Y_MIN, Y_MAX = 0, 3000
+Y_MIN, Y_MAX = 0, 4095     # 12-bit 원본 범위
 CHANNEL_COLORS = ['r', 'g', 'b', 'y']
 
-SAMPLES_PER_PACKET = 4      # 프레임 1개에 4채널 1샘플
+SAMPLES_PER_PACKET = 4       # 초기 통계용 기본값(동적으로 self.last_spp로 대체됨)
 TARGET_TOTAL_SPS = 16000
 PRINT_TO_CONSOLE = True
 
 # ===== Binary Frame 정의 =====
 FRAME_MAGIC = 0xA5C3
-FRAME_HDR_FMT = "<HHHBB"      # magic, seq, payload_len, ch_mask, flags (little-endian)
+FRAME_HDR_FMT = "<HHHBB"     # magic, seq, payload_len, ch_mask, flags (little-endian)
 FRAME_HDR_SIZE = struct.calcsize(FRAME_HDR_FMT)
 FLAG_ASCII_PAYLOAD = 0x01
 
 # ===== CSV 호환 여부 자동 감지 =====
-PREFER_BINARY = True          # True면 먼저 바이너리 시도, 안 맞으면 CSV 줄도 병행 파싱
+PREFER_BINARY = True         # True면 먼저 바이너리 시도, 안 맞으면 CSV 줄도 병행 파싱
 
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Live ADC Data (4CH) - Real-Time Axis")
+        self.setWindowTitle("Live ADC Data (4CH) - Binary Frame + CSV compatible")
 
         # 상태 변수
-        self.data_queues = [deque(maxlen=MAX_POINTS) for _ in range(4)] # <<< 수정: 이제 (시간, 값) 튜플을 저장
+        self.data_queues = [deque([0]*MAX_POINTS, maxlen=MAX_POINTS) for _ in range(4)]
         self.channel_visible = [True, True, True, True]
         self.logging_enabled = False
         self.streaming_enabled = False
@@ -83,6 +82,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pkts_since_last = 0
         self.rate_lock = Lock()
         self.prev_stats_time = QtCore.QTime.currentTime()
+
+        # 동적 samples-per-packet (프레임 전체 int16 개수)
+        self.last_spp = SAMPLES_PER_PACKET
 
         # ========== UI ==========
         central = QtWidgets.QWidget()
@@ -187,7 +189,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 chunk = self.ser.read(4096)
                 if chunk:
                     buf += chunk
-                    # 1) 먼저 바이너리 프레임 시도
+                    # 1) 바이너리 프레임 시도
                     if PREFER_BINARY:
                         consumed = self.try_parse_frames(buf)
                         if consumed > 0:
@@ -206,7 +208,7 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass  # 잡음 등 무시
 
-    # ----- Binary Frame 파서 -----
+    # ----- Binary Frame 파서 (프레임 전체 디인터리브) -----
     def try_parse_frames(self, buf: bytearray) -> int:
         """가능한 만큼 프레임을 파싱하고 소비한 바이트 수를 반환"""
         i = 0
@@ -238,13 +240,37 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     self.malformed_lines += 1
             else:
-                # payload를 4채널 int16 LE로 가정
-                if payload_len < 8:
+                # payload 전체를 int16 LE 배열로 해석 후, ch_mask에 맞춰 디인터리브
+                if payload_len < 2:
                     self.malformed_lines += 1
                 else:
                     try:
-                        v1, v2, v3, v4 = struct.unpack_from("<hhhh", payload, 0)
-                        self.handle_sample(seq, [v1, v2, v3, v4])
+                        cnt = payload_len // 2
+                        fmt = "<" + "h" * cnt
+                        arr = struct.unpack_from(fmt, payload, 0)
+
+                        # 활성 채널 목록 (마스크 0이면 4채널로 간주)
+                        ch_list = [idx for idx in range(4) if (ch_mask >> idx) & 0x1]
+                        if not ch_list:
+                            ch_list = [0, 1, 2, 3]
+                        n_ch = len(ch_list)
+
+                        # 통계용: 프레임당 총 int16 개수(=총 샘플 수)
+                        self.last_spp = cnt
+
+                        # 인터리브 해제: [ch0,ch1,..,ch(n-1), ch0,ch1,..] 가정
+                        blk = (cnt // n_ch) * n_ch
+                        if blk != cnt:
+                            arr = arr[:blk]
+
+                        zero4 = [0, 0, 0, 0]
+                        for s in range(0, len(arr), n_ch):
+                            vals = list(zero4)
+                            for k, ch in enumerate(ch_list):
+                                vals[ch] = arr[s + k]
+                            # 같은 seq로 처리(프레임 단위 증가)
+                            self.handle_sample(seq, vals)
+
                     except struct.error:
                         self.malformed_lines += 1
 
@@ -300,7 +326,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ----- 샘플 처리 공통 -----
     def handle_sample(self, seq, values):
-        timestamp = time.time() # <<< 수정: 현재 시간 기록
         now = QtCore.QTime.currentTime()
 
         # 콘솔 출력
@@ -343,7 +368,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # 그래프/로깅
         if self.streaming_enabled:
             for i in range(4):
-                self.data_queues[i].append((timestamp, values[i])) # <<< 수정: (시간, 값) 튜플로 저장
+                self.data_queues[i].append(values[i])
             if self.logging_enabled and self.csv_writer:
                 if seq is not None: self.csv_writer.writerow([seq] + values)
                 else:               self.csv_writer.writerow([""] + values)
@@ -352,12 +377,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def handle_ascii_line(self, line: str):
         if not line:
             return
-        # 여기서는 모니터용 출력만—보드로 역전송은 안 함
         if PRINT_TO_CONSOLE:
             print(f"[ASCII] {line}", flush=True)
-
-        # 필요 시 'on','off','pulse,period,duty' 같은 문자열을 받아
-        # UI 상태를 바꾸거나 로그에 남길 수 있음(선택).
+        # 필요 시 'on','off','pulse,period,duty' 등 수신 처리 확장 가능
 
     # ----- 상태바 -----
     def update_statusbar_stats(self):
@@ -368,7 +390,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pkts_since_last = 0
         rx_pkt_s = delta_pkts / dt_s
 
-        total_sps = rx_pkt_s * SAMPLES_PER_PACKET
+        # 프레임당 총 int16 개수(동적) 기준으로 sps 환산
+        total_sps = rx_pkt_s * max(1, self.last_spp)
         per_ch_sps = total_sps / 4.0
         achieve = (total_sps / TARGET_TOTAL_SPS * 100.0) if TARGET_TOTAL_SPS > 0 else 0.0
 
@@ -448,41 +471,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.graphics.clear()
         self.plots, self.curves = [], []
         for i in range(4):
-            # <<< 수정: 루프 안에서 매번 새로운 DateAxisItem을 생성합니다.
-            axis_items = {'bottom': pg.DateAxisItem()}
-            p = self.graphics.addPlot(row=i, col=0, axisItems=axis_items)
+            p = self.graphics.addPlot(row=i, col=0)
             p.showGrid(x=True, y=True)
             p.setLabel("left", f"CH{i+1}", units="V")
-
-            # <<< 추가: 첫 번째 플롯(i=0)이 아닌 경우, X축을 첫 번째 플롯에 연결(link)합니다.
-            # 이렇게 하면 모든 플롯의 시간 축이 함께 움직입니다.
-            if i > 0:
-                p.setXLink(self.plots[0])
-
-            # 마지막 플롯에만 X축 라벨을 표시하여 깔끔하게 만듭니다.
             if i == 3:
-                p.setLabel("bottom", "Time")
-            else:
-                # 나머지 플롯들의 X축 눈금 라벨은 숨겨서 더 깔끔하게 보입니다.
-                p.getAxis('bottom').setStyle(showValues=False)
-
+                p.setLabel("bottom", "Time", units="s")
+                p.getAxis("bottom").setScale(1e-3)
             p.getAxis("left").setScale(1e-3)
             p.setYRange(Y_MIN, Y_MAX)
             p.setMouseEnabled(x=True, y=True)
             curve = p.plot([], [], pen=CHANNEL_COLORS[i])
-            self.plots.append(p) # p.setXLink를 사용하려면 이 줄이 curve 추가보다 먼저 와야 합니다.
-            self.curves.append(curve)
+            self.plots.append(p); self.curves.append(curve)
 
     def toggle_merge_split(self):
         self.graphics.clear()
         if not self.merged:
-            axis_items = {'bottom': pg.DateAxisItem()} # <<< 수정: 시간 축 아이템 생성
-            p = self.graphics.addPlot(row=0, col=0, axisItems=axis_items) # <<< 수정: 시간 축 적용
+            p = self.graphics.addPlot(row=0, col=0)
             p.showGrid(x=True, y=True)
             p.setLabel("left", "Voltage", units="V")
-            p.setLabel("bottom", "Time") # <<< 수정: 단위 삭제
+            p.setLabel("bottom", "Time", units="s")
             p.getAxis("left").setScale(1e-3)
-            # p.getAxis("bottom").setScale(1e-3) # <<< 수정: 이 줄 삭제
+            p.getAxis("bottom").setScale(1e-3)
             p.setYRange(Y_MIN, Y_MAX)
             p.setMouseEnabled(x=True, y=True)
             self.curves = []
@@ -497,22 +506,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.merged:
             if self.curves:
                 vb = self.curves[0].getViewBox()
-                # vb.setXRange(0, MAX_POINTS) # <<< 수정: X축 범위 수동 설정 삭제
-                vb.setYRange(Y_MIN, Y_MAX)
+                vb.setXRange(0, MAX_POINTS); vb.setYRange(Y_MIN, Y_MAX)
         else:
             for c in self.curves:
                 vb = c.getViewBox()
-                # vb.setXRange(0, MAX_POINTS) # <<< 수정: X축 범위 수동 설정 삭제
-                vb.setYRange(Y_MIN, Y_MAX)
+                vb.setXRange(0, MAX_POINTS); vb.setYRange(Y_MIN, Y_MAX)
         self.status.showMessage("🔄 View reset")
 
     def update_plot(self):
         for i in range(len(self.curves)):
-            if self.channel_visible[i] and len(self.data_queues[i]) > 0:
-                # <<< 수정: (시간, 값) 튜플을 x, y 데이터로 분리
-                data = list(self.data_queues[i])
-                x = [item[0] for item in data]
-                y = [item[1] for item in data]
+            if self.channel_visible[i]:
+                y = list(self.data_queues[i]); x = list(range(len(y)))
                 self.curves[i].setData(x, y, connect="finite")
             else:
                 self.curves[i].setData([], [])
