@@ -1,0 +1,621 @@
+/*
+ * Copyright (c) 2018 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+/** @file
+ *  @brief Nordic UART Service Client sample (Binary + Framing enabled)
+ */
+
+#include <errno.h>
+#include <inttypes.h>                 /* PRIu8 등 */
+#include <zephyr/kernel.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/printk.h>
+
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/hci.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/gatt.h>
+
+#include <bluetooth/services/nus.h>
+#include <bluetooth/services/nus_client.h>
+#include <bluetooth/gatt_dm.h>
+#include <bluetooth/scan.h>
+
+#include <zephyr/settings/settings.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/logging/log.h>
+
+#define LOG_MODULE_NAME central_uart
+LOG_MODULE_REGISTER(LOG_MODULE_NAME);
+
+/* =====================[ 프레이밍/전송 상수 ]===================== */
+
+/* 프레임 헤더 (퍼리퍼럴과 동일) */
+#define FRAME_MAGIC            0xA5C3
+typedef struct __packed {
+    uint16_t magic;        /* 0xA5C3 (LE) */
+    uint16_t seq;          /* 증가 시퀀스 (LE) */
+    uint16_t payload_len;  /* 뒤따르는 payload 바이트 수 (LE) */
+    uint8_t  ch_mask;      /* 사용 채널 비트마스크 */
+    uint8_t  flags;        /* bit0: ASCII payload */
+} frame_hdr_t;
+
+#define DEFAULT_CH_MASK        0x0F
+#define FLAG_ASCII_PAYLOAD     0x01
+
+/* MTU 관련 (연결 후 실제 값으로 갱신). NUS 한 청크 최대 = MTU - 3 */
+static uint16_t att_mtu = 23;
+static inline uint16_t nus_max_chunk(void) { return (att_mtu > 3) ? (att_mtu - 3) : 20; }
+
+/* UART payload buffer */
+#define UART_BUF_SIZE          512
+#define UART_FLUSH_THRESHOLD   (UART_BUF_SIZE - 16)
+
+#define NUS_WRITE_TIMEOUT      K_MSEC(150)
+#define UART_WAIT_FOR_BUF_DELAY K_MSEC(50)
+#define UART_RX_TIMEOUT        50000  /* us */
+
+/* =====================[ 전역/구조체 ]===================== */
+
+static const struct device *uart = DEVICE_DT_GET(DT_CHOSEN(nordic_nus_uart));
+static struct k_work_delayable uart_work;
+
+K_SEM_DEFINE(nus_write_sem, 0, 1);
+
+static struct k_work ble_send_work;          /* (레거시 경로 유지) */
+static struct uart_data_t *pending_buf;
+
+struct uart_data_t {
+    void   *fifo_reserved;
+    uint8_t data[UART_BUF_SIZE];
+    uint16_t len;
+};
+
+static K_FIFO_DEFINE(fifo_uart_tx_data);
+static K_FIFO_DEFINE(fifo_uart_rx_data);
+
+static struct bt_conn *default_conn;
+static struct bt_nus_client nus_client;
+static uint16_t g_seq = 0;
+
+/* =====================[ BLE 전송 완료 콜백 ]===================== */
+
+static void ble_data_sent(struct bt_nus_client *nus, uint8_t err,
+                          const uint8_t *const data, uint16_t len)
+{
+    ARG_UNUSED(nus);
+    ARG_UNUSED(data);
+    ARG_UNUSED(len);
+
+    k_sem_give(&nus_write_sem);
+
+    if (err) {
+        LOG_WRN("NUS sent ATT error: 0x%02X", err);
+    }
+}
+
+/* =====================[ BLE 수신 콜백: 프레임 언패킹 → UART ]===================== */
+
+static uint8_t ble_data_received(struct bt_nus_client *nus,
+                                 const uint8_t *data, uint16_t len)
+{
+    ARG_UNUSED(nus);
+
+    /* 1) 프레임 검사 */
+    if (len >= sizeof(frame_hdr_t)) {
+        frame_hdr_t hdr;
+        memcpy(&hdr, data, sizeof(hdr));
+        uint16_t magic = sys_le16_to_cpu(hdr.magic);
+        uint16_t plen  = sys_le16_to_cpu(hdr.payload_len);
+
+        if (magic == FRAME_MAGIC && (sizeof(hdr) + plen) <= len) {
+            const uint8_t *payload = data + sizeof(hdr);
+
+            /* flags bit0가 1 → ASCII 명령. 지금은 그대로 UART로 흘려보내도 무방 */
+            const uint8_t *p = payload;
+            uint16_t remain = plen;
+
+            while (remain) {
+                struct uart_data_t *tx = k_malloc(sizeof(*tx));
+                if (!tx) { LOG_WRN("UART send buffer alloc fail"); break; }
+                size_t n = MIN(sizeof(tx->data), (size_t)remain);
+                memcpy(tx->data, p, n);
+                tx->len = (uint16_t)n;
+
+                int err = uart_tx(uart, tx->data, tx->len, SYS_FOREVER_MS);
+                if (err) {
+                    LOG_WRN("uart_tx failed (%d), enqueueing", err);
+                    k_fifo_put(&fifo_uart_tx_data, tx);
+                } /* free는 TX_DONE에서 */
+                p += n;
+                remain -= (uint16_t)n;
+            }
+            return BT_GATT_ITER_CONTINUE;
+        }
+    }
+
+    /* 2) 프레임이 아니면: 하위호환(그대로 UART로 바이너리 패스스루) */
+    for (uint16_t pos = 0; pos < len; ) {
+        struct uart_data_t *tx = k_malloc(sizeof(*tx));
+        if (!tx) { LOG_WRN("UART send buffer alloc failed"); break; }
+        size_t n = MIN(sizeof(tx->data), (size_t)(len - pos));
+        memcpy(tx->data, &data[pos], n);
+        tx->len = (uint16_t)n;
+        int err = uart_tx(uart, tx->data, tx->len, SYS_FOREVER_MS);
+        if (err) {
+            LOG_WRN("uart_tx failed (%d), enqueueing", err);
+            k_fifo_put(&fifo_uart_tx_data, tx);
+        } /* free는 TX_DONE에서 */
+        pos += (uint16_t)n;
+    }
+
+    return BT_GATT_ITER_CONTINUE;
+}
+
+/* =====================[ UART 콜백: 개행 의존 제거, 임계값/타임아웃 flush ]===================== */
+
+static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(user_data);
+
+    static size_t   aborted_len;
+    static uint8_t *aborted_buf;
+    static bool     disable_req;
+    struct uart_data_t *buf;
+
+    switch (evt->type) {
+    case UART_TX_DONE:
+        if (!evt->data.tx.len || !evt->data.tx.buf) return;
+
+        if (aborted_buf) {
+            buf = CONTAINER_OF(aborted_buf, struct uart_data_t, data[0]);
+            aborted_buf = NULL;
+            aborted_len = 0;
+        } else {
+            buf = CONTAINER_OF(evt->data.tx.buf, struct uart_data_t, data[0]);
+        }
+        k_free(buf);
+
+        buf = k_fifo_get(&fifo_uart_tx_data, K_NO_WAIT);
+        if (buf) {
+            if (uart_tx(uart, buf->data, buf->len, SYS_FOREVER_MS)) {
+                LOG_WRN("UART retry send failed");
+            }
+        }
+        break;
+
+    case UART_TX_ABORTED:
+        if (!aborted_buf) {
+            aborted_buf = (uint8_t *)evt->data.tx.buf;
+            aborted_len = 0;
+        }
+        aborted_len += evt->data.tx.len;
+        buf = CONTAINER_OF(aborted_buf, struct uart_data_t, data[0]);
+        uart_tx(uart, &buf->data[aborted_len], buf->len - aborted_len, SYS_FOREVER_MS);
+        break;
+
+    case UART_RX_RDY:
+        /* 드라이버가 evt->data.rx.buf를 순차적으로 채우며, 우리는 길이만 축적 */
+        buf = CONTAINER_OF(evt->data.rx.buf, struct uart_data_t, data[0]);
+        buf->len += evt->data.rx.len;
+
+        if (!disable_req && buf->len >= UART_FLUSH_THRESHOLD) {
+            disable_req = true;
+            uart_rx_disable(uart);
+        }
+        break;
+
+    case UART_RX_DISABLED:
+        disable_req = false;
+
+        /* 방금 버퍼가 꽉 찼으면 큐에 올려서 메인루프에서 처리 */
+        buf = k_malloc(sizeof(*buf));
+        if (buf) {
+            buf->len = 0;
+        } else {
+            LOG_WRN("RX buffer alloc fail; reschedule");
+            k_work_reschedule(&uart_work, UART_WAIT_FOR_BUF_DELAY);
+            return;
+        }
+        uart_rx_enable(uart, buf->data, sizeof(buf->data), UART_RX_TIMEOUT);
+        break;
+
+    case UART_RX_BUF_REQUEST:
+        buf = k_malloc(sizeof(*buf));
+        if (buf) {
+            buf->len = 0;
+            uart_rx_buf_rsp(uart, buf->data, sizeof(buf->data));
+        } else {
+            LOG_WRN("RX buf req: alloc fail");
+        }
+        break;
+
+    case UART_RX_BUF_RELEASED:
+        buf = CONTAINER_OF(evt->data.rx_buf.buf, struct uart_data_t, data[0]);
+        if (buf->len > 0) {
+            k_fifo_put(&fifo_uart_rx_data, buf);  /* 메인 루프에서 프레임 패킹 → BLE */
+        } else {
+            k_free(buf);
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* =====================[ NUS 전송 (MTU 기반 분할) ]===================== */
+
+static int nus_send_chunked(const uint8_t *p, uint16_t len)
+{
+    while (len) {
+        uint16_t n = MIN(nus_max_chunk(), len);
+        int err = bt_nus_client_send(&nus_client, p, n);
+        if (err) return err;
+        int s = k_sem_take(&nus_write_sem, NUS_WRITE_TIMEOUT);
+        if (s) LOG_WRN("NUS send timeout");
+        p   += n;
+        len -= n;
+    }
+    return 0;
+}
+
+/* =====================[ UART 조각 -> 프레임 구성 -> BLE 전송 ]===================== */
+
+static int send_frame_over_nus(const uint8_t *payload, uint16_t payload_len,
+                               uint8_t ch_mask, uint8_t flags)
+{
+    if (!default_conn) return -ENOTCONN;
+
+    const uint16_t total = sizeof(frame_hdr_t) + payload_len;
+    uint8_t *frame = k_malloc(total);
+    if (!frame) return -ENOMEM;
+
+    frame_hdr_t hdr;
+    hdr.magic       = sys_cpu_to_le16(FRAME_MAGIC);
+    hdr.seq         = sys_cpu_to_le16(g_seq++);
+    hdr.payload_len = sys_cpu_to_le16(payload_len);
+    hdr.ch_mask     = ch_mask;
+    hdr.flags       = flags;
+
+    memcpy(frame, &hdr, sizeof(hdr));
+    memcpy(frame + sizeof(hdr), payload, payload_len);
+
+    int err = nus_send_chunked(frame, total);
+    k_free(frame);
+    return err;
+}
+
+/* =====================[ (레거시) 워크 핸들러 ]===================== */
+
+static void ble_send_work_handler(struct k_work *w)
+{
+    ARG_UNUSED(w);
+    if (!default_conn || !pending_buf) return;
+
+    int e = nus_send_chunked(pending_buf->data, pending_buf->len);
+    if (e) LOG_ERR("Legacy send failed (err %d)", e);
+    else   LOG_INF("Legacy sent %u bytes", pending_buf->len);
+
+    k_free(pending_buf);
+    pending_buf = NULL;
+}
+
+/* =====================[ UART init ]===================== */
+
+static void uart_work_handler(struct k_work *item)
+{
+    ARG_UNUSED(item);
+    struct uart_data_t *buf = k_malloc(sizeof(*buf));
+    if (!buf) {
+        LOG_WRN("RX alloc fail; reschedule");
+        k_work_reschedule(&uart_work, UART_WAIT_FOR_BUF_DELAY);
+        return;
+    }
+    buf->len = 0;
+    uart_rx_enable(uart, buf->data, sizeof(buf->data), UART_RX_TIMEOUT);
+}
+
+static int uart_init(void)
+{
+    int err;
+    struct uart_data_t *rx;
+
+    if (!device_is_ready(uart)) {
+        LOG_ERR("UART device not ready");
+        return -ENODEV;
+    }
+
+    rx = k_malloc(sizeof(*rx));
+    if (!rx) return -ENOMEM;
+    rx->len = 0;
+
+    k_work_init_delayable(&uart_work, uart_work_handler);
+
+    err = uart_callback_set(uart, uart_cb, NULL);
+    if (err) return err;
+
+    return uart_rx_enable(uart, rx->data, sizeof(rx->data), UART_RX_TIMEOUT);
+}
+
+/* =====================[ GATT/NUS discovery ]===================== */
+
+static void discovery_complete(struct bt_gatt_dm *dm, void *context)
+{
+    struct bt_nus_client *nus = context;
+    LOG_INF("Service discovery completed");
+    bt_gatt_dm_data_print(dm);
+
+    bt_nus_handles_assign(dm, nus);
+
+    int err = bt_nus_subscribe_receive(nus);
+    if (err) {
+        LOG_ERR("bt_nus_subscribe_receive() failed (err %d)", err);
+    } else {
+        LOG_INF("bt_nus_subscribe_receive() OK");
+    }
+
+    bt_gatt_dm_data_release(dm);
+}
+
+static void discovery_service_not_found(struct bt_conn *conn, void *context)
+{
+    ARG_UNUSED(conn); ARG_UNUSED(context);
+    LOG_INF("NUS service not found");
+}
+
+static void discovery_error(struct bt_conn *conn, int err, void *context)
+{
+    ARG_UNUSED(conn); ARG_UNUSED(context);
+    LOG_WRN("GATT discovery error: %d", err);
+}
+
+static struct bt_gatt_dm_cb discovery_cb = {
+    .completed         = discovery_complete,
+    .service_not_found = discovery_service_not_found,
+    .error_found       = discovery_error,
+};
+
+static void gatt_discover(struct bt_conn *conn)
+{
+    if (conn != default_conn) return;
+    int err = bt_gatt_dm_start(conn, BT_UUID_NUS_SERVICE, &discovery_cb, &nus_client);
+    if (err) LOG_ERR("Discovery start failed: %d", err);
+}
+
+/* =====================[ MTU 교환 콜백 ]===================== */
+
+static void exchange_func(struct bt_conn *conn, uint8_t err, struct bt_gatt_exchange_params *params)
+{
+    ARG_UNUSED(params);
+    if (!err) {
+        att_mtu = bt_gatt_get_mtu(conn);
+        LOG_INF("MTU exchange done: att_mtu=%u, NUS chunk=%u", att_mtu, nus_max_chunk());
+    } else {
+        LOG_WRN("MTU exchange failed (err %" PRIu8 ")", err);
+    }
+}
+
+/* =====================[ 연결/해제/보안 콜백 ]===================== */
+
+static void connected(struct bt_conn *conn, uint8_t conn_err)
+{
+    char addr[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+    if (conn_err) {
+        LOG_INF("Connect fail %s, 0x%02x %s", addr, conn_err, bt_hci_err_to_str(conn_err));
+        if (default_conn == conn) {
+            bt_conn_unref(default_conn);
+            default_conn = NULL;
+            int e = bt_scan_start(BT_SCAN_TYPE_SCAN_ACTIVE);
+            if (e) LOG_ERR("Scan restart failed (err %d)", e);
+        }
+        return;
+    }
+
+    LOG_INF("Connected: %s", addr);
+
+    /* MTU 교환 */
+    static struct bt_gatt_exchange_params exchange_params;
+    exchange_params.func = exchange_func;
+    int e = bt_gatt_exchange_mtu(conn, &exchange_params);
+    if (e) LOG_WRN("MTU exchange req failed (%d)", e);
+
+    /* 연결 파라미터: 7.5~15ms (throughput↑) */
+    {
+        const struct bt_le_conn_param *p = BT_LE_CONN_PARAM(6, 12, 0, 400);
+        e = bt_conn_le_param_update(conn, p);
+        if (e) LOG_WRN("Conn param update req failed: %d", e);
+    }
+
+    gatt_discover(conn);
+
+    e = bt_scan_stop();
+    if ((!e) && (e != -EALREADY)) {
+        LOG_ERR("Stop LE scan failed (err %d)", e);
+    }
+}
+
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
+    char addr[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+    LOG_INF("Disconnected: %s, reason 0x%02x %s", addr, reason, bt_hci_err_to_str(reason));
+
+    if (default_conn != conn) return;
+
+    bt_conn_unref(default_conn);
+    default_conn = NULL;
+
+    int e = bt_scan_start(BT_SCAN_TYPE_SCAN_ACTIVE);
+    if (e) LOG_ERR("Scan restart failed (err %d)", e);
+}
+
+static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
+{
+    char addr[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+    if (!err) LOG_INF("Security changed: %s level %u", addr, level);
+    else      LOG_WRN("Security failed: %s level %u err %d %s", addr, level, err,
+                      bt_security_err_to_str(err));
+
+    gatt_discover(conn);
+}
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+    .connected = connected,
+    .disconnected = disconnected,
+    .security_changed = security_changed
+};
+
+/* =====================[ 스캔 콜백/초기화 ]===================== */
+
+static void scan_filter_match(struct bt_scan_device_info *device_info,
+                              struct bt_scan_filter_match *filter_match,
+                              bool connectable)
+{
+    ARG_UNUSED(filter_match);
+    char addr[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(device_info->recv_info->addr, addr, sizeof(addr));
+    LOG_INF("Filter matched: %s connectable=%d", addr, connectable);
+}
+
+static void scan_connecting_error(struct bt_scan_device_info *device_info)
+{
+    ARG_UNUSED(device_info);
+    LOG_WRN("Connecting failed");
+}
+
+static void scan_connecting(struct bt_scan_device_info *device_info, struct bt_conn *conn)
+{
+    ARG_UNUSED(device_info);
+    default_conn = bt_conn_ref(conn);
+}
+
+static int nus_client_init(void)
+{
+    struct bt_nus_client_init_param init = {
+        .cb = {
+            .received = ble_data_received,
+            .sent     = ble_data_sent,
+        }
+    };
+    int err = bt_nus_client_init(&nus_client, &init);
+    if (err) {
+        LOG_ERR("NUS Client init failed (err %d)", err);
+        return err;
+    }
+    LOG_INF("NUS Client initialized");
+    return 0;
+}
+
+BT_SCAN_CB_INIT(scan_cb, scan_filter_match, NULL, scan_connecting_error, scan_connecting);
+
+static int scan_init(void)
+{
+    int err;
+    struct bt_scan_init_param scan_init = {
+        .connect_if_match = 1,
+    };
+
+    bt_scan_init(&scan_init);
+    bt_scan_cb_register(&scan_cb);
+
+    err = bt_scan_filter_add(BT_SCAN_FILTER_TYPE_UUID, BT_UUID_NUS_SERVICE);
+    if (err) { LOG_ERR("Scan filter set failed (%d)", err); return err; }
+
+    err = bt_scan_filter_enable(BT_SCAN_UUID_FILTER, false);
+    if (err) { LOG_ERR("Scan filter enable failed (%d)", err); return err; }
+
+    LOG_INF("Scan module initialized");
+    return 0;
+}
+
+/* =====================[ 페어링 콜백(필요 시) ]===================== */
+
+static void auth_cancel(struct bt_conn *conn)
+{
+    char addr[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    LOG_INF("Pairing cancelled: %s", addr);
+}
+
+static void pairing_complete(struct bt_conn *conn, bool bonded)
+{
+    char addr[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    LOG_INF("Pairing completed: %s, bonded: %d", addr, bonded);
+}
+
+static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
+{
+    char addr[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    LOG_WRN("Pairing failed conn: %s, reason %d %s", addr, reason, bt_security_err_to_str(reason));
+}
+
+static struct bt_conn_auth_cb conn_auth_callbacks = {
+    .cancel = auth_cancel,
+};
+
+static struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
+    .pairing_complete = pairing_complete,
+    .pairing_failed   = pairing_failed
+};
+
+/* =====================[ main() ]===================== */
+
+int main(void)
+{
+    int err;
+
+    err = bt_conn_auth_cb_register(&conn_auth_callbacks);
+    if (err) { LOG_ERR("Auth cb register failed"); return 0; }
+
+    err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
+    if (err) { LOG_ERR("Auth info cb register failed"); return 0; }
+
+    err = bt_enable(NULL);
+    if (err) { LOG_ERR("Bluetooth init failed (err %d)", err); return 0; }
+    LOG_INF("Bluetooth initialized");
+
+    if (IS_ENABLED(CONFIG_SETTINGS)) settings_load();
+
+    err = uart_init();
+    if (err) { LOG_ERR("uart_init failed (%d)", err); return 0; }
+
+    err = scan_init();
+    if (err) { LOG_ERR("scan_init failed (%d)", err); return 0; }
+
+    err = nus_client_init();
+    if (err) { LOG_ERR("nus_client_init failed (%d)", err); return 0; }
+
+    printk("Starting Bluetooth Central UART (Binary+Frame)\n");
+
+    k_work_init(&ble_send_work, ble_send_work_handler); /* (레거시 유지) */
+
+    err = bt_scan_start(BT_SCAN_TYPE_SCAN_ACTIVE);
+    if (err) { LOG_ERR("Scan start failed (%d)", err); return 0; }
+    LOG_INF("Scanning started");
+
+    /* ===== 메인 루프: UART 수신 조각 → 프레임 패킹 → BLE 전송 ===== */
+    for (;;) {
+        struct uart_data_t *buf = k_fifo_get(&fifo_uart_rx_data, K_FOREVER);
+        if (buf && buf->len) {
+            /* 기본: 바이너리 payload, 프레이밍하여 전송 (퍼리퍼럴과 호환) */
+            int e = send_frame_over_nus(buf->data, buf->len, DEFAULT_CH_MASK, 0x00);
+            if (e) LOG_WRN("send_frame_over_nus err=%d (len=%u)", e, buf->len);
+        }
+        if (buf) k_free(buf);
+    }
+}
