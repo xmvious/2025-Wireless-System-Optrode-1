@@ -447,19 +447,31 @@ class MainWindow(QtWidgets.QMainWindow):
     def create_split_plots(self):
         self.graphics.clear()
         self.plots, self.curves = [], []
-        axis_items = {'bottom': pg.DateAxisItem()} # <<< 수정: 시간 축 아이템 생성
         for i in range(4):
-            p = self.graphics.addPlot(row=i, col=0, axisItems=axis_items) # <<< 수정: 시간 축 적용
+            # <<< 수정: 루프 안에서 매번 새로운 DateAxisItem을 생성합니다.
+            axis_items = {'bottom': pg.DateAxisItem()}
+            p = self.graphics.addPlot(row=i, col=0, axisItems=axis_items)
             p.showGrid(x=True, y=True)
             p.setLabel("left", f"CH{i+1}", units="V")
+
+            # <<< 추가: 첫 번째 플롯(i=0)이 아닌 경우, X축을 첫 번째 플롯에 연결(link)합니다.
+            # 이렇게 하면 모든 플롯의 시간 축이 함께 움직입니다.
+            if i > 0:
+                p.setXLink(self.plots[0])
+
+            # 마지막 플롯에만 X축 라벨을 표시하여 깔끔하게 만듭니다.
             if i == 3:
-                p.setLabel("bottom", "Time") # <<< 수정: 단위 삭제
-            # p.getAxis("bottom").setScale(1e-3) # <<< 수정: 이 줄 삭제
+                p.setLabel("bottom", "Time")
+            else:
+                # 나머지 플롯들의 X축 눈금 라벨은 숨겨서 더 깔끔하게 보입니다.
+                p.getAxis('bottom').setStyle(showValues=False)
+
             p.getAxis("left").setScale(1e-3)
             p.setYRange(Y_MIN, Y_MAX)
             p.setMouseEnabled(x=True, y=True)
             curve = p.plot([], [], pen=CHANNEL_COLORS[i])
-            self.plots.append(p); self.curves.append(curve)
+            self.plots.append(p) # p.setXLink를 사용하려면 이 줄이 curve 추가보다 먼저 와야 합니다.
+            self.curves.append(curve)
 
     def toggle_merge_split(self):
         self.graphics.clear()
