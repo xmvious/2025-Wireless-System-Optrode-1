@@ -1,0 +1,68 @@
+#
+# Copyright (c) 2018 Nordic Semiconductor ASA
+#
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+#
+
+# ==========================================================
+# 기본 설정 및 UART
+# ==========================================================
+CONFIG_SERIAL=y
+CONFIG_UART_ASYNC_API=y
+CONFIG_NRFX_UARTE0=y
+
+# ==========================================================
+# DK 라이브러리 (LED/버튼 제어에 필수)
+# ==========================================================
+CONFIG_DK_LIBRARY=y
+CONFIG_GPIO=y
+
+# ==========================================================
+# ADC (SAADC) 기능 활성화
+# ==========================================================
+CONFIG_ADC=y
+CONFIG_NRFX_SAADC=y
+
+# ==========================================================
+# 블루투스 (Peripheral 역할 + NUS 서비스)
+# ==========================================================
+CONFIG_BT=y
+# CENTRAL이 아닌 PERIPHERAL로 설정
+CONFIG_BT_PERIPHERAL=y
+CONFIG_BT_DEVICE_NAME="Nordic_UART_Service"
+
+# NUS_CLIENT가 아닌 NUS 서비스 자체를 활성화
+CONFIG_BT_NUS=y
+
+# ==========================================================
+# 스택 및 메모리 (충분한 공간 확보)
+# ==========================================================
+CONFIG_HEAP_MEM_POOL_SIZE=2048
+CONFIG_MAIN_STACK_SIZE=2048
+CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE=2048
+
+# ==========================================================
+# Bonding (페어링 정보 저장)
+# ==========================================================
+CONFIG_BT_SETTINGS=y
+CONFIG_FLASH=y
+CONFIG_FLASH_PAGE_LAYOUT=y
+CONFIG_FLASH_MAP=y
+CONFIG_BT_SMP=y
+
+# ==========================================================
+# 로깅 설정 (UART 충돌 방지를 위해 RTT 사용 권장)
+# ==========================================================
+CONFIG_LOG=y
+CONFIG_USE_SEGGER_RTT=y
+CONFIG_LOG_BACKEND_RTT=y
+CONFIG_LOG_BACKEND_UART=n
+# UART 콘솔은 사용하지 않음
+CONFIG_UART_CONSOLE=n
+CONFIG_CONSOLE=y
+CONFIG_RTT_CONSOLE=y
+
+# ==========================================================
+# 기타
+# ==========================================================
+CONFIG_ASSERT=y
