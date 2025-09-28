@@ -1,0 +1,19 @@
+/*
+ * Copyright (c) 2022 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+/ {
+	chosen {
+		nordic,nus-uart = &uart0;
+	};
+};
+
+
+&uart0 {
+   current-speed = <1000000>;   
+   status = "okay";
+};
+
+ /* 이미 있다면 중복 정의하지 말고 current-speed 값만 바꿔줘 */
