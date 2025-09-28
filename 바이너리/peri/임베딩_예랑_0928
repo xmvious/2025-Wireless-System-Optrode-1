@@ -100,6 +100,11 @@ static inline uint16_t nus_max_chunk(void) { return (att_mtu > 3) ? (att_mtu - 3
 #define ADC_RESOLUTION          12
 #define NUM_CHANNELS            4
 
+/* ====== 버스트 샘플링 수(프레임당 채널 샘플 개수) ====== */
+/* 처음엔 64 정도로 시작해서, 링크/레이트 보고 128~256으로 늘려 효율 개선 가능 */
+#define SAMPLES_PER_FRAME       64
+#define FRAME_PAYLOAD_INT16     (NUM_CHANNELS * SAMPLES_PER_FRAME)
+
 /* ============================================================
  *                       전역 상태
  * ============================================================*/
@@ -114,9 +119,13 @@ static K_SEM_DEFINE(ble_init_ok, 0, 1);
 static struct bt_conn *current_conn;
 static struct bt_conn *auth_conn;
 
+/* J-Link CDC UART (boards/app.overlay에서 nordic,nus-uart = &uart0) */
 static const struct device *uart = DEVICE_DT_GET(DT_CHOSEN(nordic_nus_uart));
 static struct k_work_delayable uart_work;
 static struct k_work ble_send_work;
+
+/* ★ 버스트 루프 on/off 플래그 */
+static bool adc_loop_on = false;
 
 static K_FIFO_DEFINE(fifo_uart_tx_data);
 static K_FIFO_DEFINE(fifo_uart_rx_data);
@@ -248,46 +257,58 @@ static int send_frame_over_nus(const uint8_t *payload, uint16_t payload_len,
 }
 
 /* ============================================================
- *                      ADC → BLE 전송 (프레임)
+ *                  버스트 샘플링(폴링) → 프레임 전송
  * ============================================================*/
-static int send_adc_as_frame(void)
-{
-    /* payload: 4ch * int16 (LE) */
-    uint8_t payload[NUM_CHANNELS * sizeof(int16_t)];
-    for (int i = 0; i < NUM_CHANNELS; i++) {
-        sys_put_le16((uint16_t)sample_buf[i], &payload[i * 2]);
-    }
-    return send_frame_over_nus(payload, sizeof(payload), DEFAULT_CH_MASK, 0x00);
-}
+static void schedule_next_adc(void); /* forward */
 
-/* ============================================================
- *                      주기적 ADC 워크/타이머
- * ============================================================*/
 static void read_adc_and_print_all(struct k_work *work)
 {
     ARG_UNUSED(work);
-    if (adc_read_4ch() == 0) {
-        /* 기본: 바이너리 프레임 전송 */
-        int e = send_adc_as_frame();
-        if (e) LOG_WRN("send_adc_as_frame err=%d", e);
-        /* 개발용 텍스트 로그가 필요하면 아래를 사용 */
-        /* printk("ADC: %d, %d, %d, %d\n", sample_buf[0], sample_buf[1], sample_buf[2], sample_buf[3]); */
+
+    /* 루프 중이 아니면 아무 것도 하지 않음 */
+    if (!adc_loop_on) return;
+
+    /* 버스트 버퍼: [ch0,ch1,ch2,ch3] 순으로 인터리브 */
+    int16_t burst[FRAME_PAYLOAD_INT16];
+
+    for (int n = 0; n < SAMPLES_PER_FRAME; n++) {
+        if (adc_read_4ch() != 0) {
+            LOG_WRN("ADC read failed in burst");
+            /* 에러 났어도 다음 워크를 계속 돌려 연결 유지 */
+            schedule_next_adc();
+            return;
+        }
+        for (int ch = 0; ch < NUM_CHANNELS; ch++) {
+            burst[n * NUM_CHANNELS + ch] = sample_buf[ch];
+        }
     }
+
+    /* payload 직렬화(LE16) */
+    uint8_t payload[FRAME_PAYLOAD_INT16 * 2];
+    for (int i = 0; i < FRAME_PAYLOAD_INT16; i++) {
+        sys_put_le16((uint16_t)burst[i], &payload[i * 2]);
+    }
+
+    int e = send_frame_over_nus(payload, sizeof(payload), DEFAULT_CH_MASK, 0x00);
+    if (e) LOG_WRN("send_frame_over_nus err=%d", e);
+
+    /* 다음 버스트 즉시 예약 → 가능한 한 빠르게 연속 전송 */
+    schedule_next_adc();
 }
 K_WORK_DEFINE(adc_work, read_adc_and_print_all);
 
-static void adc_timer_handler(struct k_timer *timer_id)
+static void schedule_next_adc(void)
 {
+    if (!adc_loop_on) return;
     k_work_submit(&adc_work);
 }
-K_TIMER_DEFINE(adc_timer, adc_timer_handler, NULL);
 
 /* ============================================================
  *                 BLE 수신 → 프레임 언프레임/하위호환
  * ============================================================*/
 static void handle_ascii_command(const char *received_string)
 {
-    /* 기존 on/off, pulse,period,duty 파싱 로직 그대로 */
+    /* 기존 on/off, pulse,period,duty 파싱 로직 유지 */
     nrf_gpio_cfg_output(GPIO_PIN);
 
     if (strchr(received_string, ',') != NULL) {
@@ -313,17 +334,16 @@ static void handle_ascii_command(const char *received_string)
         return;
     }
 
-    static bool adc_timer_started = false;
+    /* === on/off: 타이머 대신 버스트 루프 on/off === */
     if (strcmp(received_string, "on\n") == 0 || strcmp(received_string, "on") == 0) {
-        if (!adc_timer_started) {
-            k_timer_start(&adc_timer, K_MSEC(10), K_MSEC(50)); /* 즉시 시작, 주기 50ms */
-            adc_timer_started = true;
-            printk("[PERIPHERAL] ADC sampling started.\n");
+        if (!adc_loop_on) {
+            adc_loop_on = true;
+            k_work_submit(&adc_work); /* 루프 시작 */
+            printk("[PERIPHERAL] ADC burst loop started.\n");
         }
     } else if (strcmp(received_string, "off\n") == 0 || strcmp(received_string, "off") == 0) {
-        k_timer_stop(&adc_timer);
-        adc_timer_started = false;
-        printk("[PERIPHERAL] ADC sampling stopped.\n");
+        adc_loop_on = false;
+        printk("[PERIPHERAL] ADC burst loop stopped.\n");
     }
 }
 
@@ -558,7 +578,7 @@ static int uart_init_wrap(void)
     /* 시작 메시지(개발용) */
     struct uart_data_t *tx = k_malloc(sizeof(*tx));
     if (tx) {
-        const char *msg = "Starting NUS peripheral (Binary+Frame)\r\n";
+        const char *msg = "Starting NUS peripheral (Binary+Frame, BURST)\r\n";
         size_t n = MIN(sizeof(tx->data), strlen(msg));
         memcpy(tx->data, msg, n);
         tx->len = (uint16_t)n;
@@ -577,23 +597,6 @@ static int uart_init_wrap(void)
 }
 
 /* ============================================================
- *                ★ Throughput 업: MTU/PHY/DLE/ConnParam ★
- * ============================================================*/
-
-/* MTU 교환 콜백 (성공 시 실제 MTU 로그 및 반영) */
-static void mtu_exchanged(struct bt_conn *c, uint8_t err,
-                          struct bt_gatt_exchange_params *p)
-{
-    if (err) {
-        LOG_WRN("MTU exchange failed (%u)", err);
-        return;
-    }
-    uint16_t mtu = bt_gatt_get_mtu(c);
-    att_mtu = mtu;
-    LOG_INF("ATT MTU updated: %u (max NUS chunk=%u)", mtu, (mtu > 3 ? mtu - 3 : 0));
-}
-
-/* ============================================================
  *                        BLE 연결 콜백
  * ============================================================*/
 static void connected(struct bt_conn *conn, uint8_t err)
@@ -609,19 +612,6 @@ static void connected(struct bt_conn *conn, uint8_t err)
     current_conn = bt_conn_ref(conn);
     dk_set_led_on(CON_STATUS_LED);
     update_mtu_from_conn(conn);
-
-    /* --- ★ 1) ATT MTU 247 교환 요청 --- */
-    static struct bt_gatt_exchange_params ex_params;
-    ex_params.func = mtu_exchanged;
-    int e = bt_gatt_exchange_mtu(conn, &ex_params);
-    if (e) LOG_WRN("MTU exchange req failed (%d)", e);
-
-    /* --- ★ 4) 짧은 Conn Interval 요청 (7.5~15ms) --- */
-    {
-        const struct bt_le_conn_param *p = BT_LE_CONN_PARAM(6, 12, 0, 400);
-        e = bt_conn_le_param_update(conn, p);
-        if (e) LOG_WRN("Conn param update req failed: %d", e);
-    }
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -823,7 +813,7 @@ int main(void)
     }
 #endif
 
-    printk("4-channel ADC print to UART start\n");
+    printk("4-channel ADC burst to BLE start (timerless)\n");
 
     if (!device_is_ready(adc_dev)) {
         printk("ADC device not ready!\n");
