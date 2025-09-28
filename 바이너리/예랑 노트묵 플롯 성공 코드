@@ -10,7 +10,8 @@ PyQt5 + PyQtGraph 기반 4채널 실시간 플로터 (Binary Frame + CSV 호환)
 - Stim : "pulses,period,duty\n" 전송
 - CH1~CH4 가시성 토글, Merge/Split 지원, 콘솔 실시간 출력
 - 패킷 누락(lost) 및 간격 기반 갭(gap) 감지/표시
-- 상태바에 rx pkt/s, 총 sps, per-ch sps, target(16k) 달성률
+- 상태바에 rx fps, 총 sps, per-ch sps, target(16k) 달성률
+- Refresh 버튼 추가, 자동 재연결 타이머, 견고한 try_open_serial
 """
 
 import sys
@@ -23,23 +24,23 @@ from collections import deque
 from datetime import datetime
 
 import serial
-from serial import SerialException
 from serial.tools import list_ports
 
 import pyqtgraph as pg
 from PyQt5 import QtWidgets, QtCore
 
 # ===== 설정 =====
-PORT = "COM3"              # 초기 선택용 기본 포트
+PORT = "COM3"              # 초기 선택용 기본 포트(없어도 OK)
 BAUDRATE = 115200          # 권장: 1_000_000 이상 (보드/드라이버 가능 시)
 MAX_POINTS = 500
 UPDATE_INTERVAL_MS = 100
+RECONNECT_INTERVAL_MS = 1000  # 자동 재연결 체크 주기
 Y_MIN, Y_MAX = 0, 4095     # 12-bit 원본 범위
 CHANNEL_COLORS = ['r', 'g', 'b', 'y']
 
 SAMPLES_PER_PACKET = 4       # 초기 통계용 기본값(동적으로 self.last_spp로 대체됨)
 TARGET_TOTAL_SPS = 16000
-PRINT_TO_CONSOLE = True
+PRINT_TO_CONSOLE = False
 
 # ===== Binary Frame 정의 =====
 FRAME_MAGIC = 0xA5C3
@@ -70,7 +71,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.merged = False
 
         # 통계/감시
-        self.total_packets = 0
+        self.total_packets = 0          # 수신한 프레임 수
         self.lost_packets = 0
         self.malformed_lines = 0
         self.gap_count = 0
@@ -79,12 +80,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dt_history = deque(maxlen=200)
 
         # 레이트 계산(스레드-세이프)
-        self.pkts_since_last = 0
+        self.pkts_since_last = 0        # 이전 호환용(미사용)
+        self.frames_since_last = 0      # 초당 프레임 계산용
         self.rate_lock = Lock()
         self.prev_stats_time = QtCore.QTime.currentTime()
 
         # 동적 samples-per-packet (프레임 전체 int16 개수)
         self.last_spp = SAMPLES_PER_PACKET
+
+        # 마지막 수신 시각 (자동 재연결 판단용)
+        self.last_rx_time = QtCore.QTime.currentTime()
 
         # ========== UI ==========
         central = QtWidgets.QWidget()
@@ -98,6 +103,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.port_combo = QtWidgets.QComboBox()
         self.refresh_ports()
         ctrl.addWidget(self.port_combo)
+
+        # Refresh 버튼
+        self.btn_refresh = QtWidgets.QPushButton("Refresh")
+        self.btn_refresh.setToolTip("포트 목록 갱신 및 자동 오픈")
+        self.btn_refresh.clicked.connect(self.on_refresh_clicked)
+        ctrl.addWidget(self.btn_refresh)
 
         # Stim 파라미터
         ctrl.addWidget(QtWidgets.QLabel("Pulse"))
@@ -141,6 +152,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer = QtCore.QTimer(self); self.timer.timeout.connect(self.update_plot); self.timer.start(UPDATE_INTERVAL_MS)
         self.stats_timer = QtCore.QTimer(self); self.stats_timer.timeout.connect(self.update_statusbar_stats); self.stats_timer.start(1000)
 
+        # 자동 재연결 타이머
+        self.reconnect_timer = QtCore.QTimer(self)
+        self.reconnect_timer.timeout.connect(self.auto_reconnect_tick)
+        self.reconnect_timer.start(RECONNECT_INTERVAL_MS)
+
         # 시리얼 & 리더 스레드
         self.try_open_serial()
         self.start_reader_thread()
@@ -159,12 +175,19 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.port_combo.addItem("No Ports")
 
+    def on_refresh_clicked(self):
+        self.refresh_ports()
+        # 연결이 없을 때만 자동 오픈 시도 (스트리밍 중 끊지 않음)
+        if self.ser is None and not self.streaming_enabled and not self.logging_enabled:
+            self.try_open_serial()
+
     def try_open_serial(self):
         """
-        J-Link CDC 포트를 자동 탐지 + DTR/RTS 활성화 + 자가검증('on\\n' 송신 후 수신 확인).
+        J-Link CDC 포트를 자동 탐지 + DTR/RTS 활성화 + 자가검증.
         - 드롭다운에서 선택한 포트를 최우선으로 시도
         - 후보: description에 'JLink' 또는 'J-Link' 포함된 모든 포트
-        - 200ms 이내 바이트가 들어오는 포트를 '정답'으로 채택
+        - 검증: 'on\\n' 송신 → 200ms 대기 → 바이트 유입 확인
+          ★ 성공 시 즉시 'off\\n'을 보내 보드를 정지시키고 버퍼를 비운다(앱 Start와 동기화).
         """
         # 0) 기존 연결 닫기
         if self.ser:
@@ -176,7 +199,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 1) 후보 수집 (드롭다운 선택 우선)
         candidates = []
-        # 사용자가 선택한 포트(있으면 최우선)
         sel = self.port_combo.currentText() if self.port_combo.count() > 0 else None
         if sel and sel != "No Ports":
             candidates.append(sel)
@@ -188,7 +210,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 if p.device not in candidates:
                     candidates.append(p.device)
 
-        # 포트가 하나도 없으면 종료
         if not candidates:
             self.status.showMessage("No serial ports available")
             return
@@ -207,7 +228,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     rtscts=False,
                     dsrdtr=False,
                 )
-                # 일부 환경에서 DTR/RTS가 꼭 필요
                 try:
                     ser.setDTR(True)
                     ser.setRTS(True)
@@ -226,32 +246,63 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             ok = False
             try:
-                # 간단한 수신 자가검증: 'on\n' 송신 후 200ms 대기 -> 바이트가 들어오면 OK
+                # 검증: on -> 200ms 대기 -> 바이트 유입 확인
                 ser.write(b"on\n")
                 QtCore.QThread.msleep(200)
-                n = ser.in_waiting
-                if n:
+                if ser.in_waiting:
                     ok = True
             except Exception:
                 ok = False
 
             if ok:
-                # 성공: 연결 유지, 콤보박스 선택 동기화
+                # ★ 성공: 즉시 off로 스트리밍 중지, 버퍼 클리어 → 앱 Start와 동기화
+                try:
+                    ser.write(b"off\n")
+                    QtCore.QThread.msleep(50)
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                except Exception:
+                    pass
+
                 self.ser = ser
                 idx = self.port_combo.findText(port)
                 if idx >= 0:
                     self.port_combo.setCurrentIndex(idx)
                 self.status.showMessage(f"Serial opened: {port} @ {BAUDRATE}")
+                self.last_rx_time = QtCore.QTime.currentTime()
                 return
             else:
-                # 실패: 닫고 다음 후보
                 try:
                     ser.close()
                 except Exception:
                     pass
 
-        # 3) 여기까지 오면 실패
+        # 3) 실패
         self.status.showMessage("Serial open failed: no responding J-Link CDC port")
+
+    # 자동 재연결
+    def auto_reconnect_tick(self):
+        # 스트리밍/로깅 중엔 건드리지 않음
+        if self.streaming_enabled or self.logging_enabled:
+            return
+
+        # 포트가 비어 있으면 시도
+        if self.ser is None:
+            self.try_open_serial()
+            return
+
+        # 최근 수신이 없고(>2.5s) 포트가 죽은 듯 하면 재오픈
+        now = QtCore.QTime.currentTime()
+        elapsed = self.last_rx_time.msecsTo(now)
+        if elapsed < 0:
+            elapsed = 0
+        if elapsed > 2500:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+            self.try_open_serial()
 
     def start_reader_thread(self):
         self.reader_stop.clear()
@@ -267,6 +318,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 chunk = self.ser.read(4096)
                 if chunk:
+                    self.last_rx_time = QtCore.QTime.currentTime()  # 최근 수신 시각 갱신
                     buf += chunk
                     # 1) 바이너리 프레임 시도
                     if PREFER_BINARY:
@@ -311,6 +363,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
             payload = memoryview(buf)[i+FRAME_HDR_SIZE : i+FRAME_HDR_SIZE+payload_len]
 
+            # 프레임 단위 로스/카운트는 여기서 1회만 처리
+            if self.last_seq is not None:
+                expected = (self.last_seq + 1) & 0xFFFF
+                missed = (seq - expected) & 0xFFFF
+                if missed != 0:
+                    self.lost_packets += missed
+                    if PRINT_TO_CONSOLE:
+                        print(f"[LOSS] missed {missed} pkt(s): last={self.last_seq}, got={seq}", flush=True)
+            self.last_seq = seq
+            self.total_packets += 1
+            with self.rate_lock:
+                self.frames_since_last += 1  # 상태바 1s 창 카운터
+
             # flags 처리: ASCII payload 지원(옵션)
             if flags & FLAG_ASCII_PAYLOAD:
                 try:
@@ -347,8 +412,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             vals = list(zero4)
                             for k, ch in enumerate(ch_list):
                                 vals[ch] = arr[s + k]
-                            # 같은 seq로 처리(프레임 단위 증가)
-                            self.handle_sample(seq, vals)
+                            # 프레임 내부 샘플들은 seq=None (로스는 위에서 처리)
+                            self.handle_sample(None, vals)
 
                     except struct.error:
                         self.malformed_lines += 1
@@ -389,6 +454,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if values and len(values) == 4:
             self.handle_sample(seq, values)
+            # ★ CSV 한 줄 = 프레임 1개로 간주
+            self.last_spp = 4  # 4채널이므로 한 프레임당 int16 샘플 4개
+            self.total_packets += 1
+            with self.rate_lock:
+                self.frames_since_last += 1
 
         return nl_pos + 1
 
@@ -414,7 +484,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 print(f"{values[0]},{values[1]},{values[2]},{values[3]}", flush=True)
 
-        # 갭 감지
+        # 갭 감지 (샘플 간 시간 기반)
         if self.last_time is not None:
             dt_ms = self.last_time.msecsTo(now)
             if dt_ms >= 0:
@@ -427,22 +497,6 @@ class MainWindow(QtWidgets.QMainWindow):
                         if PRINT_TO_CONSOLE:
                             print(f"[GAP] dt={dt_ms}ms (>~{threshold}ms)", flush=True)
         self.last_time = now
-
-        # 누락 감지
-        if seq is not None:
-            if self.last_seq is not None:
-                expected = (self.last_seq + 1) & 0xFFFF
-                missed = (seq - expected) & 0xFFFF
-                if missed != 0:
-                    self.lost_packets += missed
-                    if PRINT_TO_CONSOLE:
-                        print(f"[LOSS] missed {missed} pkt(s): last={self.last_seq}, got={seq}", flush=True)
-            self.last_seq = seq
-
-        # 누적 및 1초 창 누적
-        self.total_packets += 1
-        with self.rate_lock:
-            self.pkts_since_last += 1
 
         # 그래프/로깅
         if self.streaming_enabled:
@@ -465,19 +519,19 @@ class MainWindow(QtWidgets.QMainWindow):
         now = QtCore.QTime.currentTime()
         dt_s = max(0.001, self.prev_stats_time.msecsTo(now) / 1000.0)
         with self.rate_lock:
-            delta_pkts = self.pkts_since_last
-            self.pkts_since_last = 0
-        rx_pkt_s = delta_pkts / dt_s
+            delta_frames = self.frames_since_last
+            self.frames_since_last = 0
+        rx_fps = delta_frames / dt_s
 
         # 프레임당 총 int16 개수(동적) 기준으로 sps 환산
-        total_sps = rx_pkt_s * max(1, self.last_spp)
+        total_sps = rx_fps * max(1, self.last_spp)
         per_ch_sps = total_sps / 4.0
         achieve = (total_sps / TARGET_TOTAL_SPS * 100.0) if TARGET_TOTAL_SPS > 0 else 0.0
 
         mode = "BIN→CSV" if PREFER_BINARY else "CSV only"
         self.status.showMessage(
             f"mode={mode} | pkt={self.total_packets}  loss={self.lost_packets}  malformed={self.malformed_lines}  gaps={self.gap_count}  |  "
-            f"rx≈{rx_pkt_s:,.1f}/s  sps≈{total_sps:,.1f}  per-ch≈{per_ch_sps:,.1f}  |  target(16k)≈{achieve:,.1f}%"
+            f"rx≈{rx_fps:,.1f} fps  sps≈{total_sps:,.1f}  per-ch≈{per_ch_sps:,.1f}  |  target(16k)≈{achieve:,.1f}%"
         )
         self.prev_stats_time = now
 
@@ -486,8 +540,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.ser is None:
             self.try_open_serial()
             if self.ser is None:
-                QtWidgets.QMessageBox.warning(self, "Serial", "Serial open failed."); return
+                QtWidgets.QMessageBox.warning(self, "Serial", "Serial open failed.")
+                return
         if not self.logging_enabled:
+            # 통계/상태 초기화
+            self.total_packets = 0
+            self.lost_packets = 0
+            self.malformed_lines = 0
+            self.gap_count = 0
+            self.last_seq = None
+            self.last_time = None
+            self.dt_history.clear()
+            with self.rate_lock:
+                self.frames_since_last = 0
+
+            # 버퍼 싹 비우고 시작
+            try:
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
+            except Exception:
+                pass
+
             filename = f"adc_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             self.last_csv_filename = filename
             try:
@@ -495,19 +568,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.csv_writer = csv.writer(self.csv_file)
                 self.csv_writer.writerow(["SEQ", "CH1", "CH2", "CH3", "CH4"])
             except Exception as e:
-                QtWidgets.QMessageBox.warning(self, "CSV", f"Failed to open CSV: {e}"); return
+                QtWidgets.QMessageBox.warning(self, "CSV", f"Failed to open CSV: {e}")
+                return
+
+            self.logging_enabled = True
+            self.streaming_enabled = True
             try:
                 self.ser.write(b"on\n")   # 보드로 ASCII 명령 전송(현 구조 유지)
             except Exception:
                 pass
-            self.logging_enabled = True
-            self.streaming_enabled = True
+
             self.status.showMessage(f"🟢 Logging started → {filename}")
 
     def stop_logging(self):
         if self.logging_enabled:
             try:
-                if self.ser: self.ser.write(b"off\n")
+                if self.ser:
+                    self.ser.write(b"off\n")
             except Exception:
                 pass
         self.logging_enabled = False
@@ -604,7 +681,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def cleanup(self):
         self.reader_stop.set()
         if self.reader_thread and self.reader_thread.is_alive():
-            self.reader_thread.join(timeout=1.0)
+            try:
+                self.reader_thread.join(timeout=1.0)
+            except Exception:
+                pass
         if self.csv_file:
             try: self.csv_file.close()
             except Exception: pass
