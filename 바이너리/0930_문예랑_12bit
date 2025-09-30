@@ -1,0 +1,857 @@
+# -*- coding: utf-8 -*-
+"""
+PyQt5 + PyQtGraph 기반 4채널 실시간 플로터 (Binary Frame + CSV 호환)
+- 기본 입력: 바이너리 프레임
+  header: 0xC3 0xA5 | seq(LE16) | payload_len(LE16) | ch_mask(u8) | flags(u8)
+  payload: int16 LE × N (인터리브: ch0,ch1,.. 반복)
+- 하위호환: "v1,v2,v3,v4\n" 또는 "seq,v1,v2,v3,v4\n" 문자열도 파싱
+- Start: 'on\n' 전송 + CSV 로깅 시작 (CSV 헤더: SEQ,CH1..CH4)
+- Stop : 'off\n' 전송 + CSV 로깅 종료
+- Stim : "pulses,period,duty\n" 전송
+- CH1~CH4 가시성 토글, Merge/Split 지원, 콘솔 실시간 출력
+- 패킷 누락(lost) 및 간격 기반 갭(gap) 감지/표시
+- 상태바에 rx fps, 총 sps, per-ch sps, target 달성률
+- Refresh 버튼 추가, 자동 재연결 타이머, 견고한 try_open_serial
+
+[업데이트: 속도 최적화]
+- 프레임 내 샘플을 numpy로 한 번에 처리(handle_block) → per-sample 오버헤드 제거
+- 그래프 setData에 numpy 배열 직접 전달
+- CSV를 블록으로 writerows() (주기적 flush)
+
+[업데이트: 12-bit PACKED 수신 지원]
+- ★ FLAG_PACKED12(0x02) 지원: 2샘플→3바이트로 패킹된 payload를 언패킹
+- ★ TARGET_TOTAL_SPS 총합 64 kS/s로 상향(16 ksps/ch 타겟)
+"""
+
+import sys
+import os
+import csv
+import struct
+import threading
+from threading import Lock
+from collections import deque
+from datetime import datetime
+
+import serial
+from serial.tools import list_ports
+
+import numpy as np  # ★ 벡터 처리
+import pyqtgraph as pg
+from PyQt5 import QtWidgets, QtCore
+
+# ===== 설정 =====
+PORT = "COM3"              # 초기 선택용 기본 포트(없어도 OK)
+BAUDRATE = 1000000         # 권장: 1_000_000 이상 (보드/드라이버 가능 시)
+MAX_POINTS = 500
+UPDATE_INTERVAL_MS = 100
+RECONNECT_INTERVAL_MS = 1000  # 자동 재연결 체크 주기
+Y_MIN, Y_MAX = 0, 4095     # 12-bit 원본 범위
+CHANNEL_COLORS = ['r', 'g', 'b', 'y']
+
+SAMPLES_PER_PACKET = 4       # 초기 통계용 기본값(동적으로 self.last_spp로 대체됨)
+TARGET_TOTAL_SPS = 64000     # ★ 총합 목표 SPS (16k/ch × 4ch)
+PRINT_TO_CONSOLE = False
+
+# ===== Binary Frame 정의 =====
+FRAME_MAGIC = 0xA5C3
+FRAME_HDR_FMT = "<HHHBB"     # magic, seq, payload_len, ch_mask, flags (little-endian)
+FRAME_HDR_SIZE = struct.calcsize(FRAME_HDR_FMT)
+FLAG_ASCII_PAYLOAD = 0x01
+FLAG_PACKED12      = 0x02     # ★ 추가: payload가 12-bit packed(2샘플→3바이트)
+
+# ===== CSV 호환 여부 자동 감지 =====
+PREFER_BINARY = True         # True면 먼저 바이너리 시도, 안 맞으면 CSV 줄도 병행 파싱
+
+
+# ★★★★★ 12-bit PACKED 언패킹 유틸리티 ★★★★★
+def unpack_packed12_to_i16(payload_bytes: memoryview) -> np.ndarray:
+    """
+    3바이트(2샘플, 12-bit×2)를 int16 두 개로 복원해 전체 payload를 int16 1차원 배열로 반환.
+    - 입력: memoryview/bytes-like
+    - 출력: np.ndarray(dtype=int16), 길이 = (len(payload)/3)*2
+    """
+    b = np.frombuffer(payload_bytes, dtype=np.uint8)
+    # 불완전 꼬리 방지
+    if b.size // 3 == 0:
+        return np.empty(0, dtype=np.int16)
+    if b.size % 3 != 0:
+        b = b[: (b.size // 3) * 3]
+
+    triplets = b.reshape(-1, 3)
+    # x = b0 | ((b1 & 0x0F) << 8)
+    # y = (b1 >> 4) | (b2 << 4)
+    x = (triplets[:, 0].astype(np.uint16) |
+         ((triplets[:, 1] & 0x0F).astype(np.uint16) << 8))
+    y = ((triplets[:, 1] >> 4).astype(np.uint16) |
+         (triplets[:, 2].astype(np.uint16) << 4))
+
+    out = np.empty(x.size + y.size, dtype=np.int16)
+    out[0::2] = x.astype(np.int16)
+    out[1::2] = y.astype(np.int16)
+    return out
+
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Live ADC Data (4CH) - Binary Frame + CSV compatible")
+
+        # 상태 변수
+        self.data_queues = [deque([0]*MAX_POINTS, maxlen=MAX_POINTS) for _ in range(4)]
+        self.channel_visible = [True, True, True, True]
+        self.logging_enabled = False
+        self.streaming_enabled = False
+        self.csv_file = None
+        self.csv_writer = None
+        self.csv_flush_timer = None  # ★ 추가
+        self.last_csv_filename = None
+        self.ser = None
+        self.reader_thread = None
+        self.reader_stop = threading.Event()
+        self.merged = False
+
+        # 통계/감시 (누적)
+        self.total_packets = 0          # 수신한 프레임 수
+        self.lost_packets = 0
+        self.malformed_lines = 0
+        self.gap_count = 0
+        self.last_seq = None
+        self.last_time = None
+        self.dt_history = deque(maxlen=200)
+
+        # 레이트 계산(스레드-세이프)
+        self.pkts_since_last = 0
+        self.frames_since_last = 0
+        self.rate_lock = Lock()
+        self.prev_stats_time = QtCore.QTime.currentTime()
+
+        # ★ 초당 통계를 위한 “최근 1초 증가분” 카운터
+        self.loss_since_last = 0
+        self.malformed_since_last = 0
+        self.gaps_since_last = 0
+
+        # 동적 samples-per-packet (프레임 전체 int16 개수)
+        self.last_spp = SAMPLES_PER_PACKET
+
+        # 마지막 수신 시각 (자동 재연결 판단용)
+        self.last_rx_time = QtCore.QTime.currentTime()
+
+        # ========== UI ==========
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        vbox = QtWidgets.QVBoxLayout(central)
+
+        ctrl = QtWidgets.QHBoxLayout()
+
+        # Port 선택
+        ctrl.addWidget(QtWidgets.QLabel("Port"))
+        self.port_combo = QtWidgets.QComboBox()
+        self.refresh_ports()
+        ctrl.addWidget(self.port_combo)
+
+        # Refresh 버튼
+        self.btn_refresh = QtWidgets.QPushButton("Refresh")
+        self.btn_refresh.setToolTip("포트 목록 갱신 및 자동 오픈")
+        self.btn_refresh.clicked.connect(self.on_refresh_clicked)
+        ctrl.addWidget(self.btn_refresh)
+
+        # Stim 파라미터
+        ctrl.addWidget(QtWidgets.QLabel("Pulse"))
+        self.pulse_edit = QtWidgets.QLineEdit(); self.pulse_edit.setFixedWidth(70); ctrl.addWidget(self.pulse_edit)
+        ctrl.addWidget(QtWidgets.QLabel("Period"))
+        self.period_edit = QtWidgets.QLineEdit(); self.period_edit.setFixedWidth(70); ctrl.addWidget(self.period_edit)
+        ctrl.addWidget(QtWidgets.QLabel("Duty"))
+        self.duty_edit = QtWidgets.QLineEdit(); self.duty_edit.setFixedWidth(70); ctrl.addWidget(self.duty_edit)
+
+        self.btn_stim = QtWidgets.QPushButton("Stim"); self.btn_stim.clicked.connect(self.send_stimulus); ctrl.addWidget(self.btn_stim)
+        ctrl.addStretch()
+
+        # Start/Stop
+        self.btn_start = QtWidgets.QPushButton("Start"); self.btn_start.clicked.connect(self.start_logging); ctrl.addWidget(self.btn_start)
+        self.btn_stop  = QtWidgets.QPushButton("Stop");  self.btn_stop.clicked.connect(self.stop_logging);  ctrl.addWidget(self.btn_stop)
+
+        # Merge/Split + Reset
+        self.btn_merge_split = QtWidgets.QPushButton("Merge"); self.btn_merge_split.clicked.connect(self.toggle_merge_split); ctrl.addWidget(self.btn_merge_split)
+        self.btn_reset = QtWidgets.QPushButton("Reset View"); self.btn_reset.clicked.connect(self.reset_view); ctrl.addWidget(self.btn_reset)
+
+        # 채널 토글
+        self.cb_ch = []
+        for i in range(4):
+            cb = QtWidgets.QCheckBox(f"CH{i+1}")
+            cb.setChecked(True)
+            cb.stateChanged.connect(lambda state, idx=i: self.toggle_channel(idx, state))
+            self.cb_ch.append(cb); ctrl.addWidget(cb)
+
+        # Open CSV
+        self.btn_open = QtWidgets.QPushButton("Open CSV"); self.btn_open.clicked.connect(self.open_csv); ctrl.addWidget(self.btn_open)
+        vbox.addLayout(ctrl)
+
+        # 그래프
+        self.graphics = pg.GraphicsLayoutWidget(); vbox.addWidget(self.graphics)
+        self.create_split_plots()
+
+        # 상태바
+        self.status = self.statusBar(); self.status.showMessage("Ready (mode: BIN first, CSV fallback)")
+
+        # 타이머들
+        self.timer = QtCore.QTimer(self); self.timer.timeout.connect(self.update_plot); self.timer.start(UPDATE_INTERVAL_MS)
+        self.stats_timer = QtCore.QTimer(self); self.stats_timer.timeout.connect(self.update_statusbar_stats); self.stats_timer.start(1000)
+
+        # 자동 재연결 타이머
+        self.reconnect_timer = QtCore.QTimer(self)
+        self.reconnect_timer.timeout.connect(self.auto_reconnect_tick)
+        self.reconnect_timer.start(RECONNECT_INTERVAL_MS)
+
+        # 시리얼 & 리더 스레드
+        self.try_open_serial()
+        self.start_reader_thread()
+
+        self.destroyed.connect(self.cleanup)
+        self.resize(1000, 800)
+
+    # ----- 포트 -----
+    def refresh_ports(self):
+        self.port_combo.clear()
+        ports = [p.device for p in list_ports.comports()]
+        if ports:
+            if PORT in ports:
+                ports.remove(PORT); ports.insert(0, PORT)
+            self.port_combo.addItems(ports)
+        else:
+            self.port_combo.addItem("No Ports")
+
+    def on_refresh_clicked(self):
+        self.refresh_ports()
+        # 연결이 없을 때만 자동 오픈 시도 (스트리밍 중 끊지 않음)
+        if self.ser is None and not self.streaming_enabled and not self.logging_enabled:
+            self.try_open_serial()
+
+    def try_open_serial(self):
+        """
+        J-Link CDC 포트를 자동 탐지 + DTR/RTS 활성화 + 자가검증.
+        - 드롭다운에서 선택한 포트를 최우선으로 시도
+        - 후보: description에 'JLink' 또는 'J-Link' 포함된 모든 포트
+        - 검증: 'on\\n' 송신 → 200ms 대기 → 바이트 유입 확인
+          ★ 성공 시 즉시 'off\\n'을 보내 보드를 정지시키고 버퍼를 비운다(앱 Start와 동기화).
+        """
+        # 0) 기존 연결 닫기
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+
+        # 1) 후보 수집 (드롭다운 선택 우선)
+        candidates = []
+        sel = self.port_combo.currentText() if self.port_combo.count() > 0 else None
+        if sel and sel != "No Ports":
+            candidates.append(sel)
+
+        # J-Link CDC 후보 추가
+        for p in list_ports.comports():
+            desc = (p.description or "").lower()
+            if "jlink" in desc or "j-link" in desc:
+                if p.device not in candidates:
+                    candidates.append(p.device)
+
+        if not candidates:
+            self.status.showMessage("No serial ports available")
+            return
+
+        def open_one(port_name: str):
+            try:
+                ser = serial.Serial(
+                    port=port_name,
+                    baudrate=BAUDRATE,
+                    timeout=0.1,
+                    write_timeout=0.2,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    xonxoff=False,
+                    rtscts=False,
+                    dsrdtr=False,
+                )
+                try:
+                    ser.setDTR(True)
+                    ser.setRTS(True)
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                except Exception:
+                    pass
+                return ser
+            except Exception:
+                return None
+
+        # 2) 후보들을 순서대로 열어보며 자가검증
+        for port in candidates:
+            ser = open_one(port)
+            if not ser:
+                continue
+            ok = False
+            try:
+                # 검증: on -> 200ms 대기 -> 바이트 유입 확인
+                ser.write(b"on\n")
+                QtCore.QThread.msleep(200)
+                if ser.in_waiting:
+                    ok = True
+            except Exception:
+                ok = False
+
+            if ok:
+                # ★ 성공: 즉시 off로 스트리밍 중지, 버퍼 클리어 → 앱 Start와 동기화
+                try:
+                    ser.write(b"off\n")
+                    QtCore.QThread.msleep(50)
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                except Exception:
+                    pass
+
+                self.ser = ser
+                idx = self.port_combo.findText(port)
+                if idx >= 0:
+                    self.port_combo.setCurrentIndex(idx)
+                self.status.showMessage(f"Serial opened: {port} @ {BAUDRATE}")
+                self.last_rx_time = QtCore.QTime.currentTime()
+                return
+            else:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+
+        # 3) 실패
+        self.status.showMessage("Serial open failed: no responding J-Link CDC port")
+
+    # 자동 재연결
+    def auto_reconnect_tick(self):
+        # 스트리밍/로깅 중엔 건드리지 않음
+        if self.streaming_enabled or self.logging_enabled:
+            return
+
+        # 포트가 비어 있으면 시도
+        if self.ser is None:
+            self.try_open_serial()
+            return
+
+        # 최근 수신이 없고(>2.5s) 포트가 죽은 듯 하면 재오픈
+        now = QtCore.QTime.currentTime()
+        elapsed = self.last_rx_time.msecsTo(now)
+        if elapsed < 0:
+            elapsed = 0
+        if elapsed > 2500:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+            self.try_open_serial()
+
+    def start_reader_thread(self):
+        self.reader_stop.clear()
+        self.reader_thread = threading.Thread(target=self.reader_loop, daemon=True)
+        self.reader_thread.start()
+
+    # ----- 수신 루프 (바이너리 우선 + CSV 백업) -----
+    def reader_loop(self):
+        buf = bytearray()
+        while not self.reader_stop.is_set():
+            if self.ser is None:
+                QtCore.QThread.msleep(200); continue
+            try:
+                chunk = self.ser.read(4096)
+                if chunk:
+                    self.last_rx_time = QtCore.QTime.currentTime()  # 최근 수신 시각 갱신
+                    buf += chunk
+                    # 1) 바이너리 프레임 시도
+                    if PREFER_BINARY:
+                        consumed = self.try_parse_frames(buf)
+                        if consumed > 0:
+                            del buf[:consumed]
+                            continue
+                    # 2) CSV 줄 파싱 (개행 기준)
+                    consumed = self.try_parse_csv_lines(buf)
+                    if consumed > 0:
+                        del buf[:consumed]
+                        continue
+                    # 3) 버퍼 과도 성장 방지: magic 검색 후 앞부분 버림
+                    if len(buf) > 8192:
+                        drop = self.resync_to_magic(buf)
+                        if drop > 0:
+                            del buf[:drop]
+            except Exception:
+                pass  # 잡음 등 무시
+
+    # ----- Binary Frame 파서 (프레임 전체 디인터리브) -----
+    def try_parse_frames(self, buf: bytearray) -> int:
+        """가능한 만큼 프레임을 파싱하고 소비한 바이트 수를 반환"""
+        i = 0
+        consumed_total = 0
+        while True:
+            if len(buf) - i < FRAME_HDR_SIZE:
+                break
+            # magic 검사 (LE)
+            magic = buf[i] | (buf[i+1] << 8)
+            if magic != FRAME_MAGIC:
+                i += 1
+                continue
+            # 헤더 파싱
+            try:
+                (magic_le, seq, payload_len, ch_mask, flags) = struct.unpack_from(FRAME_HDR_FMT, buf, i)
+            except struct.error:
+                break
+            frame_len = FRAME_HDR_SIZE + payload_len
+            if len(buf) - i < frame_len:
+                break  # 더 읽어야 함
+
+            payload = memoryview(buf)[i+FRAME_HDR_SIZE : i+FRAME_HDR_SIZE+payload_len]
+
+            # 프레임 단위 로스/카운트는 여기서 1회만 처리
+            if self.last_seq is not None:
+                expected = (self.last_seq + 1) & 0xFFFF
+                missed = (seq - expected) & 0xFFFF
+                if missed != 0:
+                    with self.rate_lock:
+                        self.lost_packets += missed
+                        self.loss_since_last += missed  # ★ 초당용 증가
+                    if PRINT_TO_CONSOLE:
+                        print(f"[LOSS] missed {missed} pkt(s): last={self.last_seq}, got={seq}", flush=True)
+            self.last_seq = seq
+            self.total_packets += 1
+            with self.rate_lock:
+                self.frames_since_last += 1  # 상태바 1s 창 카운터
+
+            # flags 처리
+            if flags & FLAG_ASCII_PAYLOAD:
+                try:
+                    line = bytes(payload).decode(errors="ignore").strip()
+                    self.handle_ascii_line(line)
+                except Exception:
+                    with self.rate_lock:
+                        self.malformed_lines += 1
+                        self.malformed_since_last += 1
+            elif flags & FLAG_PACKED12:
+                # ★ 12-bit packed 언패킹 경로
+                try:
+                    arr1d = unpack_packed12_to_i16(payload)  # int16 1D
+                    # ch_mask → 사용 채널 목록
+                    ch_list = [idx for idx in range(4) if (ch_mask >> idx) & 0x1]
+                    if not ch_list:
+                        ch_list = [0, 1, 2, 3]
+                    n_ch = len(ch_list)
+
+                    blk = (arr1d.size // n_ch) * n_ch
+                    if blk != arr1d.size:
+                        arr1d = arr1d[:blk]
+
+                    samples = blk // n_ch
+                    arr = arr1d.reshape(samples, n_ch)  # (samples, n_ch)
+
+                    self.last_spp = arr1d.size  # 프레임 내 int16 개수
+                    self.handle_block(None, arr, n_ch, ch_list)
+                except Exception:
+                    with self.rate_lock:
+                        self.malformed_lines += 1
+                        self.malformed_since_last += 1
+            else:
+                # 기본: 16-bit LE unpack (기존 경로)
+                try:
+                    cnt = payload_len // 2
+                    arr = np.frombuffer(payload, dtype='<i2', count=cnt)
+
+                    ch_list = [idx for idx in range(4) if (ch_mask >> idx) & 0x1]
+                    if not ch_list:
+                        ch_list = [0, 1, 2, 3]
+                    n_ch = len(ch_list)
+
+                    blk = (cnt // n_ch) * n_ch
+                    if blk != cnt:
+                        arr = arr[:blk]
+
+                    samples = blk // n_ch
+                    arr = arr.reshape(samples, n_ch)  # (samples, n_ch)
+                    self.last_spp = cnt
+
+                    # 프레임당 1번만 블록 반영 (성능 핵심)
+                    self.handle_block(None, arr, n_ch, ch_list)
+
+                except Exception:
+                    with self.rate_lock:
+                        self.malformed_lines += 1
+                        self.malformed_since_last += 1
+
+            i += frame_len
+            consumed_total = i
+        return consumed_total
+
+    # ----- CSV 줄 파서 (하위호환) -----
+    def try_parse_csv_lines(self, buf: bytearray) -> int:
+        try:
+            data = bytes(buf)
+            nl_pos = data.find(b'\n')
+            if nl_pos < 0:
+                return 0
+            line = data[:nl_pos+1].decode(errors="ignore").strip()
+        except Exception:
+            return 0
+
+        # 체크섬 제거
+        if '*' in line:
+            line = line.split('*', 1)[0].strip()
+        if "," not in line:
+            return nl_pos + 1
+
+        parts = [p.strip() for p in line.split(",")]
+        seq = None; values = None
+        try:
+            if len(parts) == 5:
+                seq = int(parts[0]); values = [int(x) for x in parts[1:]]
+            elif len(parts) == 4:
+                values = [int(x) for x in parts]
+            else:
+                with self.rate_lock:
+                    self.malformed_lines += 1
+                    self.malformed_since_last += 1
+        except ValueError:
+            with self.rate_lock:
+                self.malformed_lines += 1
+                self.malformed_since_last += 1
+            return nl_pos + 1
+
+        if values and len(values) == 4:
+            # CSV도 블록 경로로 (1×4)
+            arr = np.array(values, dtype=np.int16).reshape(1, 4)
+            self.handle_block(seq, arr, 4, [0, 1, 2, 3])
+            self.last_spp = 4
+            self.total_packets += 1
+            with self.rate_lock:
+                self.frames_since_last += 1
+
+        return nl_pos + 1
+
+    # ----- magic 재동기화 -----
+    def resync_to_magic(self, buf: bytearray) -> int:
+        """버퍼에서 magic(LE)을 찾아 그 전까지 버림"""
+        for idx in range(max(0, len(buf) - 2048)):
+            if idx + 1 < len(buf):
+                m = buf[idx] | (buf[idx+1] << 8)
+                if m == FRAME_MAGIC:
+                    return idx
+        # 못 찾으면 절반 버림
+        return len(buf) // 2
+
+    # ----- (신규) 블록 처리: 그래프/CSV 한 번에 -----
+    def handle_block(self, seq, arr_i16: np.ndarray, n_ch: int, ch_list):
+        if arr_i16.size == 0:
+            return
+
+        # ch_mask 반영: 4채널 형태로 확장
+        if len(ch_list) != 4:
+            full = np.zeros((arr_i16.shape[0], 4), dtype=np.int16)
+            for k, ch in enumerate(ch_list):
+                full[:, ch] = arr_i16[:, k]
+            arr4 = full
+        else:
+            arr4 = arr_i16
+
+        # 그래프/버퍼
+        if self.streaming_enabled:
+            # deque 확장 (tolist는 GIL 있지만 한번만 호출)
+            cols = [arr4[:, i].tolist() for i in range(4)]
+            for i in range(4):
+                self.data_queues[i].extend(cols[i])
+
+            # CSV 블록 쓰기
+            if self.logging_enabled and self.csv_writer:
+                if seq is not None:
+                    seq_col = np.full((arr4.shape[0], 1), seq, dtype=object)
+                else:
+                    seq_col = np.full((arr4.shape[0], 1), "", dtype=object)
+                rows = np.hstack([seq_col, arr4.astype(object)]).tolist()
+                self.csv_writer.writerows(rows)
+
+        # 간격 기반 갭 감지는 샘플 단위가 아니라 프레임 단위로 유지
+        now = QtCore.QTime.currentTime()
+        if self.last_time is not None:
+            dt_ms = self.last_time.msecsTo(now)
+            if dt_ms >= 0:
+                self.dt_history.append(dt_ms)
+                if len(self.dt_history) >= 20:
+                    median_dt = sorted(self.dt_history)[len(self.dt_history)//2]
+                    threshold = max(10, 3 * median_dt)
+                    if dt_ms > threshold:
+                        with self.rate_lock:
+                            self.gap_count += 1
+                            self.gaps_since_last += 1
+                        if PRINT_TO_CONSOLE:
+                            print(f"[GAP] dt={dt_ms}ms (>~{threshold}ms)", flush=True)
+        self.last_time = now
+
+    # ----- (기존) 단일 샘플 처리: 하위호환 경로에서만 사용 -----
+    def handle_sample(self, seq, values):
+        now = QtCore.QTime.currentTime()
+
+        if PRINT_TO_CONSOLE:
+            if seq is not None:
+                print(f"{seq},{values[0]},{values[1]},{values[2]},{values[3]}", flush=True)
+            else:
+                print(f"{values[0]},{values[1]},{values[2]},{values[3]}", flush=True)
+
+        if self.last_time is not None:
+            dt_ms = self.last_time.msecsTo(now)
+            if dt_ms >= 0:
+                self.dt_history.append(dt_ms)
+                if len(self.dt_history) >= 20:
+                    median_dt = sorted(self.dt_history)[len(self.dt_history)//2]
+                    threshold = max(10, 3 * median_dt)
+                    if dt_ms > threshold:
+                        with self.rate_lock:
+                            self.gap_count += 1
+                            self.gaps_since_last += 1
+                        if PRINT_TO_CONSOLE:
+                            print(f"[GAP] dt={dt_ms}ms (>~{threshold}ms)", flush=True)
+        self.last_time = now
+
+        if self.streaming_enabled:
+            for i in range(4):
+                self.data_queues[i].append(values[i])
+            if self.logging_enabled and self.csv_writer:
+                if seq is not None: self.csv_writer.writerow([seq] + values)
+                else:               self.csv_writer.writerow([""] + values)
+
+    # ----- ASCII 명령 처리 (flags & 0x01일 때) -----
+    def handle_ascii_line(self, line: str):
+        if not line:
+            return
+        if PRINT_TO_CONSOLE:
+            print(f"[ASCII] {line}", flush=True)
+        # 필요 시 'on','off','pulse,period,duty' 등 수신 처리 확장 가능
+
+    # ----- 상태바 -----
+    def update_statusbar_stats(self):
+        now = QtCore.QTime.currentTime()
+        dt_s = max(0.001, self.prev_stats_time.msecsTo(now) / 1000.0)
+        with self.rate_lock:
+            delta_frames = self.frames_since_last
+            self.frames_since_last = 0
+
+            delta_loss = self.loss_since_last
+            delta_malformed = self.malformed_since_last
+            delta_gaps = self.gaps_since_last
+            # ★ 사용 후 리셋 → “최근 1초” 통계가 되도록
+            self.loss_since_last = 0
+            self.malformed_since_last = 0
+            self.gaps_since_last = 0
+
+        rx_fps = delta_frames / dt_s
+
+        # 프레임당 총 int16 개수(동적) 기준으로 sps 환산
+        total_sps = rx_fps * max(1, self.last_spp)
+        per_ch_sps = total_sps / 4.0
+        achieve = (total_sps / TARGET_TOTAL_SPS * 100.0) if TARGET_TOTAL_SPS > 0 else 0.0
+
+        # ★ 동적 타겟 표기
+        target_k = int(TARGET_TOTAL_SPS / 1000)
+        mode = "BIN→CSV" if PREFER_BINARY else "CSV only"
+        self.status.showMessage(
+            f"mode={mode} | pkt={self.total_packets}  |  "
+            f"rx≈{rx_fps:,.1f} fps  sps≈{total_sps:,.1f}  per-ch≈{per_ch_sps:,.1f}  |  "
+            f"loss/s≈{delta_loss/dt_s:.2f}  malformed/s≈{delta_malformed/dt_s:.2f}  gaps/s≈{delta_gaps/dt_s:.2f}  |  "
+            f"target({target_k}k)≈{achieve:,.1f}%"
+        )
+        self.prev_stats_time = now
+
+    # ----- 버튼 핸들러 -----
+    def start_logging(self):
+        if self.ser is None:
+            self.try_open_serial()
+            if self.ser is None:
+                QtWidgets.QMessageBox.warning(self, "Serial", "Serial open failed.")
+                return
+        if not self.logging_enabled:
+            # 통계/상태 초기화
+            self.total_packets = 0
+            self.lost_packets = 0
+            self.malformed_lines = 0
+            self.gap_count = 0
+            self.last_seq = None
+            self.last_time = None
+            self.dt_history.clear()
+            with self.rate_lock:
+                self.frames_since_last = 0
+                # ★ 초당용 카운터 리셋
+                self.loss_since_last = 0
+                self.malformed_since_last = 0
+                self.gaps_since_last = 0
+
+            # 버퍼 싹 비우고 시작
+            try:
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
+            except Exception:
+                pass
+
+            filename = f"adc_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            self.last_csv_filename = filename
+            try:
+                self.csv_file = open(filename, mode="w", newline="")
+                self.csv_writer = csv.writer(self.csv_file)
+                self.csv_writer.writerow(["SEQ", "CH1", "CH2", "CH3", "CH4"])
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "CSV", f"Failed to open CSV: {e}")
+                return
+
+            # ★ 주기적 플러시 (I/O 병목 방지 + 데이터 보존)
+            self.csv_flush_timer = QtCore.QTimer(self)
+            self.csv_flush_timer.timeout.connect(lambda: (self.csv_file and self.csv_file.flush()))
+            self.csv_flush_timer.start(1000)
+
+            self.logging_enabled = True
+            self.streaming_enabled = True
+            try:
+                self.ser.write(b"on\n")   # 보드로 ASCII 명령 전송(현 구조 유지)
+            except Exception:
+                pass
+
+            self.status.showMessage(f"🟢 Logging started → {filename}")
+
+    def stop_logging(self):
+        if self.logging_enabled:
+            try:
+                if self.ser:
+                    self.ser.write(b"off\n")
+            except Exception:
+                pass
+        self.logging_enabled = False
+        self.streaming_enabled = False
+        try:
+            if self.csv_flush_timer:
+                self.csv_flush_timer.stop()
+                self.csv_flush_timer = None
+            if self.csv_file:
+                self.csv_file.flush()
+                self.csv_file.close()
+        finally:
+            self.csv_file = None; self.csv_writer = None
+        self.status.showMessage("🛑 Logging stopped. CSV file closed.")
+
+    def send_stimulus(self):
+        pulses = self.pulse_edit.text().strip()
+        period = self.period_edit.text().strip()
+        duty   = self.duty_edit.text().strip()
+        if not (pulses.isdigit() and period.isdigit() and duty.isdigit()):
+            QtWidgets.QMessageBox.warning(self, "Stim", "Invalid input. Use integers."); return
+        cmd = f"{pulses},{period},{duty}\n".encode()
+        try:
+            if self.ser is None: self.try_open_serial()
+            if self.ser:
+                self.ser.write(cmd)   # ASCII 명령 전송(하위호환)
+                self.status.showMessage(f"📤 Sent stimulus: {pulses},{period},{duty}")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Serial", f"Write failed: {e}")
+
+    def toggle_channel(self, idx, state):
+        self.channel_visible[idx] = (state == QtCore.Qt.Checked)
+
+    def open_csv(self):
+        if self.last_csv_filename and os.path.exists(self.last_csv_filename):
+            try: os.startfile(self.last_csv_filename)
+            except AttributeError:
+                import subprocess; opener = "open" if sys.platform == "darwin" else "xdg-open"
+                subprocess.call([opener, self.last_csv_filename])
+        else:
+            QtWidgets.QMessageBox.information(self, "CSV", "No CSV file to open.")
+
+    # ----- 그래프 -----
+    def create_split_plots(self):
+        self.graphics.clear()
+        self.plots, self.curves = [], []
+        for i in range(4):
+            p = self.graphics.addPlot(row=i, col=0)
+            p.showGrid(x=True, y=True)
+            p.setLabel("left", f"CH{i+1}", units="V")
+            if i == 3:
+                p.setLabel("bottom", "Time", units="s")
+                p.getAxis("bottom").setScale(1e-3)
+            p.getAxis("left").setScale(1e-3)
+            p.setYRange(Y_MIN, Y_MAX)
+            p.setMouseEnabled(x=True, y=True)
+            curve = p.plot([], [], pen=CHANNEL_COLORS[i])
+            self.plots.append(p); self.curves.append(curve)
+
+    def toggle_merge_split(self):
+        self.graphics.clear()
+        if not self.merged:
+            p = self.graphics.addPlot(row=0, col=0)
+            p.showGrid(x=True, y=True)
+            p.setLabel("left", "Voltage", units="V")
+            p.setLabel("bottom", "Time", units="s")
+            p.getAxis("left").setScale(1e-3)
+            p.getAxis("bottom").setScale(1e-3)
+            p.setYRange(Y_MIN, Y_MAX)
+            p.setMouseEnabled(x=True, y=True)
+            self.curves = []
+            for i in range(4):
+                self.curves.append(p.plot([], [], pen=CHANNEL_COLORS[i], name=f"CH{i+1}"))
+            self.merged = True; self.btn_merge_split.setText("Split")
+        else:
+            self.create_split_plots()
+            self.merged = False; self.btn_merge_split.setText("Merge")
+
+    def reset_view(self):
+        if self.merged:
+            if self.curves:
+                vb = self.curves[0].getViewBox()
+                vb.setXRange(0, MAX_POINTS); vb.setYRange(Y_MIN, Y_MAX)
+        else:
+            for c in self.curves:
+                vb = c.getViewBox()
+                vb.setXRange(0, MAX_POINTS); vb.setYRange(Y_MIN, Y_MAX)
+        self.status.showMessage("🔄 View reset")
+
+    def update_plot(self):
+        # ★ numpy 기반 렌더링 (deque → ndarray)
+        for i in range(len(self.curves)):
+            if self.channel_visible[i]:
+                dq = self.data_queues[i]
+                if dq:
+                    y = np.fromiter(dq, dtype=np.int16, count=len(dq))
+                    x = np.arange(y.size, dtype=np.int32)
+                    self.curves[i].setData(x, y, connect="finite")
+                else:
+                    self.curves[i].setData([], [])
+            else:
+                self.curves[i].setData([], [])
+
+    # ----- 종료 -----
+    def cleanup(self):
+        self.reader_stop.set()
+        if self.reader_thread and self.reader_thread.is_alive():
+            try:
+                self.reader_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        if self.csv_flush_timer:
+            try: self.csv_flush_timer.stop()
+            except Exception: pass
+        if self.csv_file:
+            try:
+                self.csv_file.flush()
+                self.csv_file.close()
+            except Exception: pass
+        if self.ser:
+            try: self.ser.close()
+            except Exception: pass
+
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    pg.setConfigOptions(antialias=True, useOpenGL=False)
+    win = MainWindow(); win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
