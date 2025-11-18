@@ -159,7 +159,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cb_ch.append(cb); ctrl.addWidget(cb)
 
         self.cb_timestamp = QtWidgets.QCheckBox("Time(μs) X-axis")
-        self.cb_timestamp.setChecked(true)
+        self.cb_timestamp.setChecked(True)
         self.cb_timestamp.stateChanged.connect(self.toggle_timestamp_mode)
         ctrl.addWidget(self.cb_timestamp)
 
