@@ -2,11 +2,13 @@
 """
 PyQt5 + PyQtGraph 기반 4채널 실시간 플로터 (Binary Frame + CSV 호환)
 - 고주파수 사인파 개선 버전
-- 스캐터 → 라인 모드로 변경
+- 스캐터 → 라인/스캐터 모드 (pyqtgraph PlotDataItem + symbol)
 - 적응형 포인트 수 조정
 - 안티앨리어싱 개선
 - [수정] 데이터 버퍼 길이 제한 해제 (이전 데이터 확인 기능)
 - [수정] 고정된 표시창 및 자동/수동 스크롤 기능 추가
+- [수정] 샘플 인덱스 기반 시간축 (프레임 뭉침 현상 완화)
+- [수정] x/y 길이 mismatch 발생 시 최소 길이로 잘라서 setData
 """
 
 import sys
@@ -28,15 +30,15 @@ from PyQt5 import QtWidgets, QtCore
 # ===== 설정 =====
 PORT = "COM3"
 BAUDRATE = 1000000
-UPDATE_INTERVAL_MS = 16   # (수정) 부드러운 스크롤을 위해 약간 조정 (8 -> 16)
+UPDATE_INTERVAL_MS = 16    # 부드러운 스크롤
 RECONNECT_INTERVAL_MS = 1000
-Y_MIN, Y_MAX = 0, 4095
-VISIBLE_SAMPLES = 5000     # (추가) 화면에 고정적으로 표시할 샘플 수
+Y_MIN, Y_MAX = 0, 2095     # ★ 사용자가 바꾼 값 (ADC 상위 절반만 보기)
+VISIBLE_SAMPLES = 5000     # 화면에 고정적으로 표시할 샘플 수
 CHANNEL_COLORS_DARK = ['r', 'g', 'c', 'y']
 CHANNEL_COLORS_LIGHT = ['r', 'g', 'b', 'm']
 
 SAMPLES_PER_PACKET = 4
-TARGET_TOTAL_SPS = 20000
+TARGET_TOTAL_SPS = 20000   # 4채널 합 20 kS/s → 채널당 5 kS/s
 PRINT_TO_CONSOLE = False
 
 # ===== Binary Frame 정의 =====
@@ -74,8 +76,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("Live ADC Data (4CH) - Scrolling View Enabled")
 
         # 상태 변수
-        self.data_queues = [deque() for _ in range(4)] # maxlen 제거
-        self.time_queues = [deque() for _ in range(4)] # maxlen 제거
+        self.data_queues = [deque() for _ in range(4)]  # maxlen 제거
+        self.time_queues = [deque() for _ in range(4)]  # maxlen 제거
         self.channel_visible = [True, True, True, True]
         self.logging_enabled = False
         self.streaming_enabled = False
@@ -89,7 +91,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.merged = False
         self.dark_mode = True
         self.use_timestamp_xaxis = True
-        self.auto_pan_enabled = True # (추가) 자동 스크롤 상태 플래그
+        self.auto_pan_enabled = True  # 자동 스크롤 상태 플래그
 
         # 통계/감시 (누적)
         self.total_packets = 0
@@ -117,6 +119,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.logging_start_time = None
         self.sample_row_index = 0
 
+        # ★ 전체 샘플 인덱스(연속 시간축 용)
+        self.sample_counter = 0
+
         # ========== UI ==========
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -134,46 +139,79 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl.addWidget(self.btn_refresh)
 
         ctrl.addWidget(QtWidgets.QLabel("Pulse"))
-        self.pulse_edit = QtWidgets.QLineEdit(); self.pulse_edit.setFixedWidth(70); ctrl.addWidget(self.pulse_edit)
-        ctrl.addWidget(QtWidgets.QLabel("Period"))
-        self.period_edit = QtWidgets.QLineEdit(); self.period_edit.setFixedWidth(70); ctrl.addWidget(self.period_edit)
-        ctrl.addWidget(QtWidgets.QLabel("Duty"))
-        self.duty_edit = QtWidgets.QLineEdit(); self.duty_edit.setFixedWidth(70); ctrl.addWidget(self.duty_edit)
+        self.pulse_edit = QtWidgets.QLineEdit()
+        self.pulse_edit.setFixedWidth(70)
+        ctrl.addWidget(self.pulse_edit)
 
-        self.btn_stim = QtWidgets.QPushButton("Stim"); self.btn_stim.clicked.connect(self.send_stimulus); ctrl.addWidget(self.btn_stim)
+        ctrl.addWidget(QtWidgets.QLabel("Period"))
+        self.period_edit = QtWidgets.QLineEdit()
+        self.period_edit.setFixedWidth(70)
+        ctrl.addWidget(self.period_edit)
+
+        ctrl.addWidget(QtWidgets.QLabel("Duty"))
+        self.duty_edit = QtWidgets.QLineEdit()
+        self.duty_edit.setFixedWidth(70)
+        ctrl.addWidget(self.duty_edit)
+
+        self.btn_stim = QtWidgets.QPushButton("Stim")
+        self.btn_stim.clicked.connect(self.send_stimulus)
+        ctrl.addWidget(self.btn_stim)
         ctrl.addStretch()
 
-        self.btn_start = QtWidgets.QPushButton("Start"); self.btn_start.clicked.connect(self.start_logging); ctrl.addWidget(self.btn_start)
-        self.btn_stop  = QtWidgets.QPushButton("Stop");  self.btn_stop.clicked.connect(self.stop_logging);  ctrl.addWidget(self.btn_stop)
+        self.btn_start = QtWidgets.QPushButton("Start")
+        self.btn_start.clicked.connect(self.start_logging)
+        ctrl.addWidget(self.btn_start)
 
-        self.btn_merge_split = QtWidgets.QPushButton("Merge"); self.btn_merge_split.clicked.connect(self.toggle_merge_split); ctrl.addWidget(self.btn_merge_split)
-        self.btn_reset = QtWidgets.QPushButton("Reset View"); self.btn_reset.clicked.connect(self.reset_view); ctrl.addWidget(self.btn_reset)
-        
-        self.btn_theme = QtWidgets.QPushButton("Light Mode"); self.btn_theme.clicked.connect(self.toggle_theme); ctrl.addWidget(self.btn_theme)
+        self.btn_stop = QtWidgets.QPushButton("Stop")
+        self.btn_stop.clicked.connect(self.stop_logging)
+        ctrl.addWidget(self.btn_stop)
+
+        self.btn_merge_split = QtWidgets.QPushButton("Merge")
+        self.btn_merge_split.clicked.connect(self.toggle_merge_split)
+        ctrl.addWidget(self.btn_merge_split)
+
+        self.btn_reset = QtWidgets.QPushButton("Reset View")
+        self.btn_reset.clicked.connect(self.reset_view)
+        ctrl.addWidget(self.btn_reset)
+
+        self.btn_theme = QtWidgets.QPushButton("Light Mode")
+        self.btn_theme.clicked.connect(self.toggle_theme)
+        ctrl.addWidget(self.btn_theme)
 
         self.cb_ch = []
         for i in range(4):
             cb = QtWidgets.QCheckBox(f"CH{i+1}")
             cb.setChecked(True)
             cb.stateChanged.connect(lambda state, idx=i: self.toggle_channel(idx, state))
-            self.cb_ch.append(cb); ctrl.addWidget(cb)
+            self.cb_ch.append(cb)
+            ctrl.addWidget(cb)
 
         self.cb_timestamp = QtWidgets.QCheckBox("Time(μs) X-axis")
         self.cb_timestamp.setChecked(True)
         self.cb_timestamp.stateChanged.connect(self.toggle_timestamp_mode)
         ctrl.addWidget(self.cb_timestamp)
 
-        self.btn_open = QtWidgets.QPushButton("Open CSV"); self.btn_open.clicked.connect(self.open_csv); ctrl.addWidget(self.btn_open)
+        self.btn_open = QtWidgets.QPushButton("Open CSV")
+        self.btn_open.clicked.connect(self.open_csv)
+        ctrl.addWidget(self.btn_open)
+
         vbox.addLayout(ctrl)
 
-        self.graphics = pg.GraphicsLayoutWidget(); vbox.addWidget(self.graphics)
-        self.plots, self.curves = [], [] # (수정) plots 리스트를 클래스 멤버로 초기화
+        self.graphics = pg.GraphicsLayoutWidget()
+        vbox.addWidget(self.graphics)
+        self.plots, self.curves = [], []
         self.create_split_plots()
 
-        self.status = self.statusBar(); self.status.showMessage("Ready (Scrolling View Enabled)")
+        self.status = self.statusBar()
+        self.status.showMessage("Ready (Scrolling View Enabled)")
 
-        self.timer = QtCore.QTimer(self); self.timer.timeout.connect(self.update_plot); self.timer.start(UPDATE_INTERVAL_MS)
-        self.stats_timer = QtCore.QTimer(self); self.stats_timer.timeout.connect(self.update_statusbar_stats); self.stats_timer.start(1000)
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.update_plot)
+        self.timer.start(UPDATE_INTERVAL_MS)
+
+        self.stats_timer = QtCore.QTimer(self)
+        self.stats_timer.timeout.connect(self.update_statusbar_stats)
+        self.stats_timer.start(1000)
 
         self.reconnect_timer = QtCore.QTimer(self)
         self.reconnect_timer.timeout.connect(self.auto_reconnect_tick)
@@ -189,13 +227,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_range_changed(self):
         self.auto_pan_enabled = False
 
-    # ----- 포트 (이하 동일) -----
+    # ----- 포트 -----
     def refresh_ports(self):
         self.port_combo.clear()
         ports = [p.device for p in list_ports.comports()]
         if ports:
             if PORT in ports:
-                ports.remove(PORT); ports.insert(0, PORT)
+                ports.remove(PORT)
+                ports.insert(0, PORT)
             self.port_combo.addItems(ports)
         else:
             self.port_combo.addItem("No Ports")
@@ -207,8 +246,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def try_open_serial(self):
         if self.ser:
-            try: self.ser.close()
-            except Exception: pass
+            try:
+                self.ser.close()
+            except Exception:
+                pass
             self.ser = None
 
         candidates = []
@@ -228,51 +269,76 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def open_one(port_name: str):
             try:
-                import time; time.sleep(0.1)
-                ser = serial.Serial(port=port_name, baudrate=BAUDRATE, timeout=0.05, write_timeout=0.1)
+                import time
+                time.sleep(0.1)
+                ser = serial.Serial(
+                    port=port_name,
+                    baudrate=BAUDRATE,
+                    timeout=0.05,
+                    write_timeout=0.1,
+                )
                 time.sleep(0.2)
                 try:
-                    ser.setDTR(True); ser.setRTS(True)
-                    ser.reset_input_buffer(); ser.reset_output_buffer()
-                except Exception: pass
+                    ser.setDTR(True)
+                    ser.setRTS(True)
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                except Exception:
+                    pass
                 return ser
-            except Exception: return None
+            except Exception:
+                return None
 
         for port in candidates:
             ser = open_one(port)
-            if not ser: continue
+            if not ser:
+                continue
             ok = False
             try:
-                ser.write(b"on\n"); QtCore.QThread.msleep(200)
-                if ser.in_waiting: ok = True
-            except Exception as e: print(f"Port {port} validation failed: {e}")
+                ser.write(b"on\n")
+                QtCore.QThread.msleep(200)
+                if ser.in_waiting:
+                    ok = True
+            except Exception as e:
+                print(f"Port {port} validation failed: {e}")
 
             if ok:
                 try:
-                    ser.write(b"off\n"); QtCore.QThread.msleep(50)
-                    ser.reset_input_buffer(); ser.reset_output_buffer()
-                except Exception: pass
+                    ser.write(b"off\n")
+                    QtCore.QThread.msleep(50)
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                except Exception:
+                    pass
                 self.ser = ser
                 idx = self.port_combo.findText(port)
-                if idx >= 0: self.port_combo.setCurrentIndex(idx)
+                if idx >= 0:
+                    self.port_combo.setCurrentIndex(idx)
                 self.status.showMessage(f"Serial opened: {port} @ {BAUDRATE}")
                 self.last_rx_time = QtCore.QTime.currentTime()
                 return
             else:
-                try: ser.close()
-                except Exception: pass
+                try:
+                    ser.close()
+                except Exception:
+                    pass
         self.status.showMessage("Serial open failed: no responding J-Link CDC port")
 
     def auto_reconnect_tick(self):
-        if self.streaming_enabled or self.logging_enabled: return
+        if self.streaming_enabled or self.logging_enabled:
+            return
         if self.ser is None:
-            self.try_open_serial(); return
+            self.try_open_serial()
+            return
         now = QtCore.QTime.currentTime()
         elapsed = self.last_rx_time.msecsTo(now)
-        if elapsed < 0: elapsed = 0
+        if elapsed < 0:
+            elapsed = 0
         if elapsed > 2500:
-            try: self.ser.close()
-            except Exception: pass
+            try:
+                self.ser.close()
+            except Exception:
+                pass
             self.ser = None
             self.try_open_serial()
 
@@ -285,7 +351,8 @@ class MainWindow(QtWidgets.QMainWindow):
         buf = bytearray()
         while not self.reader_stop.is_set():
             if self.ser is None or not self.ser.is_open:
-                QtCore.QThread.msleep(200); continue
+                QtCore.QThread.msleep(200)
+                continue
             try:
                 chunk = self.ser.read(4096)
                 if chunk:
@@ -296,138 +363,191 @@ class MainWindow(QtWidgets.QMainWindow):
                         consumed = self.try_parse_frames(buf)
                     if consumed == 0:
                         consumed = self.try_parse_csv_lines(buf)
-                    
+
                     if consumed > 0:
                         del buf[:consumed]
                     elif len(buf) > 8192:
                         drop = self.resync_to_magic(buf)
-                        if drop > 0: del buf[:drop]
-            except Exception: pass
+                        if drop > 0:
+                            del buf[:drop]
+            except Exception:
+                pass
 
     def try_parse_frames(self, buf: bytearray) -> int:
         i, consumed_total = 0, 0
         while len(buf) - i >= FRAME_HDR_SIZE:
-            magic = buf[i] | (buf[i+1] << 8)
-            if magic != FRAME_MAGIC: i += 1; continue
-            try: (magic_le, seq, payload_len, ch_mask, flags) = struct.unpack_from(FRAME_HDR_FMT, buf, i)
-            except struct.error: break
+            magic = buf[i] | (buf[i + 1] << 8)
+            if magic != FRAME_MAGIC:
+                i += 1
+                continue
+            try:
+                (magic_le, seq, payload_len, ch_mask, flags) = struct.unpack_from(
+                    FRAME_HDR_FMT, buf, i
+                )
+            except struct.error:
+                break
             frame_len = FRAME_HDR_SIZE + payload_len
-            if len(buf) - i < frame_len: break
+            if len(buf) - i < frame_len:
+                break
 
-            payload = memoryview(buf)[i+FRAME_HDR_SIZE : i+FRAME_HDR_SIZE+payload_len]
+            payload = memoryview(buf)[
+                i + FRAME_HDR_SIZE : i + FRAME_HDR_SIZE + payload_len
+            ]
+
             if self.last_seq is not None:
                 missed = (seq - ((self.last_seq + 1) & 0xFFFF)) & 0xFFFF
                 if missed != 0:
-                    with self.rate_lock: self.lost_packets += missed; self.loss_since_last += missed
-            self.last_seq = seq; self.total_packets += 1
-            with self.rate_lock: self.frames_since_last += 1
+                    with self.rate_lock:
+                        self.lost_packets += missed
+                        self.loss_since_last += missed
+            self.last_seq = seq
+            self.total_packets += 1
+            with self.rate_lock:
+                self.frames_since_last += 1
 
             try:
                 if flags & FLAG_ASCII_PAYLOAD:
                     line = bytes(payload).decode(errors="ignore").strip()
                     self.handle_ascii_line(line)
                 else:
-                    arr1d = unpack_packed12_to_i16(payload) if flags & FLAG_PACKED12 else np.frombuffer(payload, dtype='<i2')
-                    ch_list = [idx for idx in range(4) if (ch_mask >> idx) & 0x1] or list(range(4))
+                    arr1d = (
+                        unpack_packed12_to_i16(payload)
+                        if flags & FLAG_PACKED12
+                        else np.frombuffer(payload, dtype="<i2")
+                    )
+                    ch_list = [
+                        idx for idx in range(4) if (ch_mask >> idx) & 0x1
+                    ] or list(range(4))
                     n_ch = len(ch_list)
                     blk = (arr1d.size // n_ch) * n_ch
-                    if blk == 0: continue
+                    if blk == 0:
+                        i += frame_len
+                        consumed_total = i
+                        continue
                     arr = arr1d[:blk].reshape(-1, n_ch)
                     self.last_spp = arr1d.size
                     self.handle_block(None, arr, n_ch, ch_list)
             except Exception:
-                with self.rate_lock: self.malformed_lines += 1; self.malformed_since_last += 1
-            i += frame_len; consumed_total = i
+                with self.rate_lock:
+                    self.malformed_lines += 1
+                    self.malformed_since_last += 1
+
+            i += frame_len
+            consumed_total = i
         return consumed_total
 
     def try_parse_csv_lines(self, buf: bytearray) -> int:
         try:
-            data = bytes(buf); nl_pos = data.find(b'\n')
-            if nl_pos < 0: return 0
-            line = data[:nl_pos+1].decode(errors="ignore").strip()
-        except Exception: return 0
-        if '*' in line: line = line.split('*', 1)[0].strip()
-        if "," not in line: return nl_pos + 1
+            data = bytes(buf)
+            nl_pos = data.find(b"\n")
+            if nl_pos < 0:
+                return 0
+            line = data[: nl_pos + 1].decode(errors="ignore").strip()
+        except Exception:
+            return 0
+
+        if "*" in line:
+            line = line.split("*", 1)[0].strip()
+        if "," not in line:
+            return nl_pos + 1
+
         parts = [p.strip() for p in line.split(",")]
         try:
-            if len(parts) == 5: seq = int(parts[0]); values = [int(x) for x in parts[1:]]
-            elif len(parts) == 4: seq = None; values = [int(x) for x in parts]
-            else: raise ValueError()
+            if len(parts) == 5:
+                seq = int(parts[0])
+                values = [int(x) for x in parts[1:]]
+            elif len(parts) == 4:
+                seq = None
+                values = [int(x) for x in parts]
+            else:
+                raise ValueError()
             arr = np.array(values, dtype=np.int16).reshape(1, 4)
             self.handle_block(seq, arr, 4, [0, 1, 2, 3])
-            self.last_spp = 4; self.total_packets += 1
-            with self.rate_lock: self.frames_since_last += 1
+            self.last_spp = 4
+            self.total_packets += 1
+            with self.rate_lock:
+                self.frames_since_last += 1
         except ValueError:
-            with self.rate_lock: self.malformed_lines += 1; self.malformed_since_last += 1
+            with self.rate_lock:
+                self.malformed_lines += 1
+                self.malformed_since_last += 1
         return nl_pos + 1
 
     def resync_to_magic(self, buf: bytearray) -> int:
         for idx in range(max(0, len(buf) - 2048)):
             if idx + 1 < len(buf):
-                m = buf[idx] | (buf[idx+1] << 8)
-                if m == FRAME_MAGIC: return idx
+                m = buf[idx] | (buf[idx + 1] << 8)
+                if m == FRAME_MAGIC:
+                    return idx
         return len(buf) // 2
 
     def handle_block(self, seq, arr_i16: np.ndarray, n_ch: int, ch_list):
-        if arr_i16.size == 0: return
+        if arr_i16.size == 0:
+            return
+
         arr4 = arr_i16
         if len(ch_list) != 4:
             full = np.zeros((arr_i16.shape[0], 4), dtype=np.int16)
-            for k, ch in enumerate(ch_list): full[:, ch] = arr_i16[:, k]
+            for k, ch in enumerate(ch_list):
+                full[:, ch] = arr_i16[:, k]
             arr4 = full
-        
+
+        # ===== 샘플 카운터 기반 시간축 =====
         if self.streaming_enabled:
             num_rows = arr4.shape[0]
-            if num_rows == 0: return # (추가) 0-row 방지
-            
-            current_time = QtCore.QTime.currentTime()
-            # (수정) 이 값은 이제 '블록의 마지막 샘플' 타임스탬프로 사용됩니다.
-            last_sample_elapsed_us = (self.logging_start_time.msecsTo(current_time) * 1000) if self.logging_start_time else 0
-            
-            # (수정) 개별 샘플 타임스탬프 생성
-            sps_per_ch = TARGET_TOTAL_SPS / 4.0 # 4채널 기준
-            
+            if num_rows == 0:
+                return
+
+            # 채널당 샘플링 레이트 (보드 설정과 정합)
+            sps_per_ch = TARGET_TOTAL_SPS / 4.0  # 20000 / 4 = 5000 SPS
+
             if sps_per_ch > 0:
-                time_per_sample_us = 1_000_000.0 / sps_per_ch
-                
-                # (수정) 블록의 첫 번째 샘플 시간을 역산합니다.
-                # (last_sample_elapsed_us가 마지막 샘플의 시간이므로)
-                first_sample_time_us = last_sample_elapsed_us - ((num_rows - 1) * time_per_sample_us)
-                
-                # (수정) 첫 시간부터 time_per_sample_us 간격으로 num_rows개의 타임스탬프 배열 생성
-                time_stamps = np.arange(num_rows, dtype=np.float64) * time_per_sample_us + first_sample_time_us
+                time_per_sample_us = 1_000_000.0 / sps_per_ch  # 1/5000 s = 200 us
+
+                # 이번 블록의 샘플 인덱스 범위: [sample_counter, sample_counter + num_rows)
+                start_idx = self.sample_counter
+                indices = start_idx + np.arange(num_rows, dtype=np.int64)
+
+                # 이상적인 시간축: 샘플 0 → 0 us, 이후 200 us씩 증가
+                time_stamps = indices.astype(np.float64) * time_per_sample_us
+
+                # 다음 블록 대비 샘플 카운터 증가
+                self.sample_counter += num_rows
             else:
-                # SPS가 0이거나 알 수 없는 경우, 기존 동작(블록 타임) 유지
-                time_stamps = np.full(num_rows, last_sample_elapsed_us, dtype=np.float64)
+                # 레이트를 모르면 fallback
+                time_stamps = np.zeros(num_rows, dtype=np.float64)
 
             for i in range(4):
                 self.data_queues[i].extend(arr4[:, i])
-                # (수정) [elapsed_us] * num_rows 대신 생성된 time_stamps 배열을 사용
-                self.time_queues[i].extend(time_stamps) 
-            
+                self.time_queues[i].extend(time_stamps)
+
             if self.logging_enabled and self.csv_writer:
-                # (수정) CSV 로깅도 개별 타임스탬프 사용
-                seq_col = np.full((num_rows, 1), seq if seq is not None else "", dtype=object)
-                # (수정) time_stamps 배열을 세로 열로 변환
-                time_col = time_stamps.reshape(-1, 1).astype(object) 
+                seq_col = np.full(
+                    (num_rows, 1), seq if seq is not None else "", dtype=object
+                )
+                time_col = time_stamps.reshape(-1, 1).astype(object)
                 rows = np.hstack([seq_col, arr4.astype(object), time_col]).tolist()
                 self.csv_writer.writerows(rows)
                 self.sample_row_index += num_rows
-        
+        # ===== 시간축 끝 =====
+
         now = QtCore.QTime.currentTime()
         if self.last_time is not None:
             dt_ms = self.last_time.msecsTo(now)
             if dt_ms >= 0:
                 self.dt_history.append(dt_ms)
                 if len(self.dt_history) >= 20:
-                    median_dt = sorted(self.dt_history)[len(self.dt_history)//2]
+                    median_dt = sorted(self.dt_history)[len(self.dt_history) // 2]
                     threshold = max(10, 3 * median_dt)
                     if dt_ms > threshold:
-                        with self.rate_lock: self.gap_count += 1; self.gaps_since_last += 1
+                        with self.rate_lock:
+                            self.gap_count += 1
+                            self.gaps_since_last += 1
         self.last_time = now
 
     def handle_ascii_line(self, line: str):
-        if PRINT_TO_CONSOLE and line: print(f"[ASCII] {line}", flush=True)
+        if PRINT_TO_CONSOLE and line:
+            print(f"[ASCII] {line}", flush=True)
 
     def update_statusbar_stats(self):
         now = QtCore.QTime.currentTime()
@@ -435,15 +555,21 @@ class MainWindow(QtWidgets.QMainWindow):
         with self.rate_lock:
             delta_frames, self.frames_since_last = self.frames_since_last, 0
             delta_loss, self.loss_since_last = self.loss_since_last, 0
-            delta_malformed, self.malformed_since_last = self.malformed_since_last, 0
+            delta_malformed, self.malformed_since_last = (
+                self.malformed_since_last,
+                0,
+            )
             delta_gaps, self.gaps_since_last = self.gaps_since_last, 0
 
         rx_fps = delta_frames / dt_s
         total_sps = rx_fps * max(1, self.last_spp)
         per_ch_sps = total_sps / 4.0
-        achieve = (total_sps / TARGET_TOTAL_SPS * 100.0) if TARGET_TOTAL_SPS > 0 else 0.0
+        achieve = (
+            (total_sps / TARGET_TOTAL_SPS * 100.0) if TARGET_TOTAL_SPS > 0 else 0.0
+        )
         target_k = int(TARGET_TOTAL_SPS / 1000)
         mode = "BIN→CSV" if PREFER_BINARY else "CSV only"
+
         self.status.showMessage(
             f"mode={mode} | pkt={self.total_packets}  |  "
             f"rx≈{rx_fps:,.1f} fps  sps≈{total_sps:,.1f}  per-ch≈{per_ch_sps:,.1f}  |  "
@@ -453,198 +579,320 @@ class MainWindow(QtWidgets.QMainWindow):
         self.prev_stats_time = now
 
     def start_logging(self):
-        if self.ser is None: self.try_open_serial()
-        if self.ser is None: QtWidgets.QMessageBox.warning(self, "Serial", "Serial open failed."); return
+        if self.ser is None:
+            self.try_open_serial()
+        if self.ser is None:
+            QtWidgets.QMessageBox.warning(self, "Serial", "Serial open failed.")
+            return
+
         if not self.logging_enabled:
-            self.total_packets, self.lost_packets, self.malformed_lines, self.gap_count = 0, 0, 0, 0
-            self.last_seq, self.last_time = None, None
-            self.dt_history.clear(); self.sample_row_index = 0
-            
+            self.total_packets = 0
+            self.lost_packets = 0
+            self.malformed_lines = 0
+            self.gap_count = 0
+            self.last_seq = None
+            self.last_time = None
+            self.dt_history.clear()
+            self.sample_row_index = 0
+
+            # 샘플 카운터 리셋
+            self.sample_counter = 0
+
             self.data_queues = [deque() for _ in range(4)]
             self.time_queues = [deque() for _ in range(4)]
-            with self.rate_lock: self.frames_since_last, self.loss_since_last, self.malformed_since_last, self.gaps_since_last = 0, 0, 0, 0
-            
-            try: self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
-            except Exception: pass
-            
+            with self.rate_lock:
+                self.frames_since_last = 0
+                self.loss_since_last = 0
+                self.malformed_since_last = 0
+                self.gaps_since_last = 0
+
+            try:
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
+            except Exception:
+                pass
+
             self.logging_start_time = QtCore.QTime.currentTime()
             filename = f"adc_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             self.last_csv_filename = filename
+
             try:
                 self.csv_file = open(filename, mode="w", newline="")
                 self.csv_writer = csv.writer(self.csv_file)
                 self.csv_writer.writerow(["SEQ", "CH1", "CH2", "CH3", "CH4", "Time(us)"])
-            except Exception as e: QtWidgets.QMessageBox.warning(self, "CSV", f"Failed to open CSV: {e}"); return
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "CSV", f"Failed to open CSV: {e}")
+                return
 
             self.csv_flush_timer = QtCore.QTimer(self)
-            self.csv_flush_timer.timeout.connect(lambda: (self.csv_file and self.csv_file.flush()))
+            self.csv_flush_timer.timeout.connect(
+                lambda: (self.csv_file and self.csv_file.flush())
+            )
             self.csv_flush_timer.start(1000)
-            
-            self.logging_enabled = True; self.streaming_enabled = True
-            try: self.ser.write(b"on\n")
-            except Exception: pass
+
+            self.logging_enabled = True
+            self.streaming_enabled = True
+            try:
+                self.ser.write(b"on\n")
+            except Exception:
+                pass
+
             self.status.showMessage(f"🟢 Logging started → {filename}")
 
     def stop_logging(self):
         if self.logging_enabled:
             try:
-                if self.ser: self.ser.write(b"off\n")
-            except Exception: pass
-            self.logging_enabled = False; self.streaming_enabled = False
+                if self.ser:
+                    self.ser.write(b"off\n")
+            except Exception:
+                pass
+
+            self.logging_enabled = False
+            self.streaming_enabled = False
+
             try:
-                if self.csv_flush_timer: self.csv_flush_timer.stop(); self.csv_flush_timer = None
-                if self.csv_file: self.csv_file.flush(); self.csv_file.close()
+                if self.csv_flush_timer:
+                    self.csv_flush_timer.stop()
+                    self.csv_flush_timer = None
+                if self.csv_file:
+                    self.csv_file.flush()
+                    self.csv_file.close()
             finally:
-                self.csv_file, self.csv_writer, self.logging_start_time = None, None, None
+                self.csv_file = None
+                self.csv_writer = None
+                self.logging_start_time = None
+
             self.status.showMessage("🛑 Logging stopped. CSV file closed.")
 
     def send_stimulus(self):
-        pulses, period, duty = self.pulse_edit.text().strip(), self.period_edit.text().strip(), self.duty_edit.text().strip()
+        pulses = self.pulse_edit.text().strip()
+        period = self.period_edit.text().strip()
+        duty = self.duty_edit.text().strip()
+
         if not (pulses.isdigit() and period.isdigit() and duty.isdigit()):
-            QtWidgets.QMessageBox.warning(self, "Stim", "Invalid input. Use integers."); return
+            QtWidgets.QMessageBox.warning(
+                self, "Stim", "Invalid input. Use integers."
+            )
+            return
+
         cmd = f"{pulses},{period},{duty}\n".encode()
         try:
-            if self.ser is None: self.try_open_serial()
-            if self.ser: self.ser.write(cmd); self.status.showMessage(f"📤 Sent stimulus: {pulses},{period},{duty}")
-        except Exception as e: QtWidgets.QMessageBox.warning(self, "Serial", f"Write failed: {e}")
+            if self.ser is None:
+                self.try_open_serial()
+            if self.ser:
+                self.ser.write(cmd)
+                self.status.showMessage(f"📤 Sent stimulus: {pulses},{period},{duty}")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Serial", f"Write failed: {e}")
 
-    def toggle_channel(self, idx, state): self.channel_visible[idx] = (state == QtCore.Qt.Checked)
-    
+    def toggle_channel(self, idx, state):
+        self.channel_visible[idx] = (state == QtCore.Qt.Checked)
+
     def toggle_timestamp_mode(self, state):
         self.use_timestamp_xaxis = (state == QtCore.Qt.Checked)
-        if self.merged: self.merged = False; self.toggle_merge_split()
-        else: self.create_split_plots()
-    
+        if self.merged:
+            self.merged = False
+            self.toggle_merge_split()
+        else:
+            self.create_split_plots()
+
     def toggle_theme(self):
         self.dark_mode = not self.dark_mode
-        bg_color, fg_color = ('k', 'w') if self.dark_mode else ('w', 'k')
-        pg.setConfigOption('background', bg_color); pg.setConfigOption('foreground', fg_color)
+        bg_color, fg_color = ("k", "w") if self.dark_mode else ("w", "k")
+        pg.setConfigOption("background", bg_color)
+        pg.setConfigOption("foreground", fg_color)
         self.btn_theme.setText("Light Mode" if self.dark_mode else "Dark Mode")
+
         old_widget, self.graphics = self.graphics, pg.GraphicsLayoutWidget()
         self.centralWidget().layout().replaceWidget(old_widget, self.graphics)
         old_widget.deleteLater()
-        if self.merged: self.merged = False; self.toggle_merge_split()
-        else: self.create_split_plots()
+
+        if self.merged:
+            self.merged = False
+            self.toggle_merge_split()
+        else:
+            self.create_split_plots()
 
     def open_csv(self):
         if self.last_csv_filename and os.path.exists(self.last_csv_filename):
-            try: os.startfile(self.last_csv_filename)
-            except AttributeError: import subprocess; opener = "open" if sys.platform == "darwin" else "xdg-open"; subprocess.call([opener, self.last_csv_filename])
-        else: QtWidgets.QMessageBox.information(self, "CSV", "No CSV file to open.")
+            try:
+                os.startfile(self.last_csv_filename)
+            except AttributeError:
+                import subprocess
+
+                opener = "open" if sys.platform == "darwin" else "xdg-open"
+                subprocess.call([opener, self.last_csv_filename])
+        else:
+            QtWidgets.QMessageBox.information(
+                self, "CSV", "No CSV file to open."
+            )
 
     # ----- 그래프 -----
     def create_split_plots(self):
         self.graphics.clear()
         self.plots, self.curves = [], []
         colors = CHANNEL_COLORS_DARK if self.dark_mode else CHANNEL_COLORS_LIGHT
+
         for i in range(4):
             p = self.graphics.addPlot(row=i, col=0)
             p.showGrid(x=True, y=True)
             p.setLabel("left", f"CH{i+1}", units="V")
-            p.setLabel("bottom", "Time", units="μs") if self.use_timestamp_xaxis else p.setLabel("bottom", "Sample Index")
+            if self.use_timestamp_xaxis:
+                p.setLabel("bottom", "Time", units="μs")
+            else:
+                p.setLabel("bottom", "Sample Index")
             p.getAxis("left").setScale(1e-3)
             p.setYRange(Y_MIN, Y_MAX)
             p.setMouseEnabled(x=True, y=True)
-            p.sigRangeChanged.connect(self.on_range_changed) # (추가) 시그널 연결
+            p.sigRangeChanged.connect(self.on_range_changed)
             self.plots.append(p)
-            curve = p.plot([], [], pen=None, symbol='o', symbolSize=5, symbolBrush=colors[i], symbolPen=None)
+
+            curve = p.plot(
+                [], [],
+                pen=None,
+                symbol="o",
+                symbolSize=5,
+                symbolBrush=colors[i],
+                symbolPen=None,
+            )
             self.curves.append(curve)
 
     def toggle_merge_split(self):
         self.graphics.clear()
         colors = CHANNEL_COLORS_DARK if self.dark_mode else CHANNEL_COLORS_LIGHT
         self.plots, self.curves = [], []
-        
+
         if not self.merged:
             p = self.graphics.addPlot(row=0, col=0)
             p.showGrid(x=True, y=True)
             p.setLabel("left", "Voltage", units="V")
-            p.setLabel("bottom", "Time", units="μs") if self.use_timestamp_xaxis else p.setLabel("bottom", "Sample Index")
+            if self.use_timestamp_xaxis:
+                p.setLabel("bottom", "Time", units="μs")
+            else:
+                p.setLabel("bottom", "Sample Index")
             p.getAxis("left").setScale(1e-3)
             p.setYRange(Y_MIN, Y_MAX)
             p.setMouseEnabled(x=True, y=True)
-            p.sigRangeChanged.connect(self.on_range_changed) # (추가) 시그널 연결
+            p.sigRangeChanged.connect(self.on_range_changed)
             self.plots.append(p)
+
             for i in range(4):
-                curve = p.plot([], [], pen=None, symbol='o', symbolSize=5, symbolBrush=colors[i], symbolPen=None, name=f"CH{i+1}")
+                curve = p.plot(
+                    [],
+                    [],
+                    pen=None,
+                    symbol="o",
+                    symbolSize=5,
+                    symbolBrush=colors[i],
+                    symbolPen=None,
+                    name=f"CH{i+1}",
+                )
                 self.curves.append(curve)
-            self.merged = True; self.btn_merge_split.setText("Split")
+            self.merged = True
+            self.btn_merge_split.setText("Split")
         else:
             self.create_split_plots()
-            self.merged = False; self.btn_merge_split.setText("Merge")
+            self.merged = False
+            self.btn_merge_split.setText("Merge")
 
-    # (수정) Reset View 버튼 로직 변경
     def reset_view(self):
-        self.auto_pan_enabled = True # 자동 스크롤 활성화
+        self.auto_pan_enabled = True
         for p in self.plots:
-             p.setYRange(Y_MIN, Y_MAX) # Y축은 고정된 범위로 리셋
-        self.update_plot() # update_plot을 호출하여 X축 범위를 최신으로 즉시 업데이트
+            p.setYRange(Y_MIN, Y_MAX)
+        self.update_plot()
         self.status.showMessage("🔄 View reset. Auto-scrolling enabled.")
 
-    # (수정) Plot 업데이트 로직 전체 변경
     def update_plot(self):
-        # 1. 모든 커브의 데이터를 업데이트 (전체 데이터)
+        # 1. 모든 커브의 데이터를 업데이트
         for i in range(len(self.curves)):
             if self.channel_visible[i]:
                 dq = self.data_queues[i]
                 if dq:
-                    y = np.array(dq)
+                    # y 먼저
+                    y = np.array(dq, dtype=np.float64)
+
+                    # x 생성
                     if self.use_timestamp_xaxis:
                         x = np.array(self.time_queues[i], dtype=np.float64)
                     else:
                         x = np.arange(y.size, dtype=np.int32)
+
+                    # ★ x, y 길이 mismatch 방지
+                    min_len = min(x.size, y.size)
+                    if min_len <= 0:
+                        self.curves[i].clear()
+                        continue
+
+                    x = x[:min_len]
+                    y = y[:min_len]
+
                     self.curves[i].setData(x=x, y=y, pen=None)
                 else:
                     self.curves[i].clear()
             else:
                 self.curves[i].clear()
-        
-        # 2. 자동 스크롤이 활성화된 경우에만 X축 표시 범위를 조정
+
+        # 2. 자동 스크롤이 켜져 있으면 X축 범위 이동
         if self.auto_pan_enabled and self.data_queues[0]:
             num_samples = len(self.data_queues[0])
             if num_samples > 1:
-                start_x, last_x = 0, 0
                 if self.use_timestamp_xaxis:
                     tq = self.time_queues[0]
+                    # 길이 불일치 가능성 대비
+                    if not tq:
+                        return
                     last_x = tq[-1]
                     start_idx = max(0, num_samples - VISIBLE_SAMPLES)
+                    # 인덱스 방어
+                    if start_idx >= len(tq):
+                        start_idx = max(0, len(tq) - 1)
                     start_x = tq[start_idx]
-                else: # Index mode
+                else:
                     last_x = num_samples - 1
                     start_x = max(0, last_x - VISIBLE_SAMPLES)
 
-                # 3. 모든 플롯의 X축 범위를 동기화 (피드백 방지 처리 포함)
                 for plot in self.plots:
                     try:
                         plot.sigRangeChanged.disconnect(self.on_range_changed)
                         plot.setXRange(start_x, last_x, padding=0)
                         plot.sigRangeChanged.connect(self.on_range_changed)
                     except (TypeError, RuntimeError):
-                        pass # 이미 연결이 끊어졌을 경우 등 예외 처리
+                        pass
 
-    # ----- 종료 -----
     def cleanup(self):
         self.reader_stop.set()
         if self.reader_thread and self.reader_thread.is_alive():
-            try: self.reader_thread.join(timeout=1.0)
-            except Exception: pass
+            try:
+                self.reader_thread.join(timeout=1.0)
+            except Exception:
+                pass
         if self.csv_flush_timer:
-            try: self.csv_flush_timer.stop()
-            except Exception: pass
+            try:
+                self.csv_flush_timer.stop()
+            except Exception:
+                pass
         if self.csv_file:
-            try: self.csv_file.flush(); self.csv_file.close()
-            except Exception: pass
+            try:
+                self.csv_file.flush()
+                self.csv_file.close()
+            except Exception:
+                pass
         if self.ser:
-            try: self.ser.close()
-            except Exception: pass
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
     pg.setConfigOptions(antialias=True, useOpenGL=True, enableExperimental=True)
-    pg.setConfigOption('background', 'k')
-    pg.setConfigOption('foreground', 'w')
-    win = MainWindow(); win.show()
+    pg.setConfigOption("background", "k")
+    pg.setConfigOption("foreground", "w")
+    win = MainWindow()
+    win.show()
     sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
     main()
