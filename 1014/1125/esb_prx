@@ -1,0 +1,86 @@
+/*
+ * ESB Receiver (RX) - Dongle/PC Interface
+ * ESB 수신 -> UART Pass-through
+ */
+
+#include <zephyr/kernel.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/usb/usb_device.h>
+#include <esb.h>
+#include <string.h>
+
+/* UART 설정 */
+static const struct device *uart = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+static struct esb_payload tx_payload; // ACK에 실어 보낼 데이터 (on/off)
+
+/* ===== ESB 이벤트 핸들러 ===== */
+void event_handler(struct esb_evt const *event) {
+    switch (event->evt_id) {
+    case ESB_EVENT_RX_RECEIVED:
+        struct esb_payload rx_payload;
+        // 1. ESB 패킷 읽기
+        while (esb_read_rx_payload(&rx_payload) == 0) {
+            // 2. UART로 그대로 전송 (파이썬이 해석함)
+            uart_tx(uart, rx_payload.data, rx_payload.length, SYS_FOREVER_MS);
+            
+            // 3. ACK 페이로드(명령어)가 있으면 큐에 다시 등록
+            if (tx_payload.length > 0) {
+                esb_write_payload(&tx_payload);
+            }
+        }
+        break;
+    default: break;
+    }
+}
+
+/* ===== UART 수신 콜백 (PC -> RX -> TX 명령 전달) ===== */
+static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data) {
+    switch (evt->type) {
+    case UART_RX_RDY:
+        // PC에서 데이터가 오면 ACK Payload에 복사해서 TX가 가져가게 함
+        if (evt->data.rx.len > 0) {
+            // 안전을 위해 최대 길이 제한
+            size_t len = MIN(evt->data.rx.len, CONFIG_ESB_MAX_PAYLOAD_LENGTH);
+            memcpy(tx_payload.data, evt->data.rx.buf + evt->data.rx.offset, len);
+            tx_payload.length = len;
+            tx_payload.pipe = 0;
+            
+            // 다음 ACK에 이 데이터를 실어 보냄
+            esb_write_payload(&tx_payload);
+        }
+        break;
+    case UART_RX_DISABLED:
+        // RX 버퍼 재활성화
+        {
+            static uint8_t rx_buf[64];
+            uart_rx_enable(uart, rx_buf, sizeof(rx_buf), 1000);
+        }
+        break;
+    default: break;
+    }
+}
+
+int main(void) {
+    // 1. USB/UART Init
+    if (IS_ENABLED(CONFIG_USB_DEVICE_STACK)) {
+        usb_enable(NULL);
+    }
+    
+    static uint8_t rx_buf[64];
+    uart_callback_set(uart, uart_cb, NULL);
+    uart_rx_enable(uart, rx_buf, sizeof(rx_buf), 1000);
+
+    // 2. ESB Init (PRX Role)
+    struct esb_config config = ESB_DEFAULT_CONFIG;
+    config.protocol = ESB_PROTOCOL_ESB_DPL;
+    config.mode = ESB_MODE_PRX; // 수신 모드
+    config.event_handler = event_handler;
+    config.bitrate = ESB_BITRATE_2MBPS;
+    config.crc = ESB_CRC_16BIT;
+    
+    esb_init(&config);
+    esb_start_rx();
+
+    printk("ESB RX Dongle Started. Waiting for packets...\n");
+    return 0;
+}
