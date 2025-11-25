@@ -1,0 +1,172 @@
+/*
+ * ESB Transmitter (TX) - Sensor Board
+ * 정확한 200us 타이머 샘플링 + 12-bit Packing
+ */
+
+#include <zephyr/kernel.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/drivers/adc.h>
+#include <zephyr/drivers/gpio.h>
+#include <esb.h>
+#include <string.h>
+
+/* ===== 설정 ===== */
+#define SAMPLING_INTERVAL_US  200   // 5kHz (200us)
+#define SAMPLES_PER_CHUNK     20    // 20개 모이면 전송
+#define NUM_CHANNELS          4
+
+/* Frame Header (파이썬 호환) */
+#define FRAME_MAGIC  0xA5C3
+struct __packed frame_hdr {
+    uint16_t magic;
+    uint16_t seq;
+    uint16_t payload_len;
+    uint8_t  ch_mask;
+    uint8_t  flags;
+};
+
+#define FLAG_PACKED12  0x02
+
+/* ADC 설정 (기존과 동일) */
+static const struct device *adc_dev = DEVICE_DT_GET(DT_NODELABEL(adc));
+static const uint8_t channel_ids[NUM_CHANNELS] = {2, 4, 5, 6}; // AIN2, 4, 5, 6
+static int16_t raw_sample_buf[NUM_CHANNELS];
+static struct adc_sequence sequence = {
+    .buffer = raw_sample_buf,
+    .buffer_size = sizeof(raw_sample_buf),
+    .resolution = 12,
+};
+
+/* 버퍼링 및 상태 */
+static int16_t tx_buffer[SAMPLES_PER_CHUNK * NUM_CHANNELS];
+static int tx_buf_idx = 0;
+static uint16_t packet_seq = 0;
+static bool streaming_enabled = false;
+
+/* ESB Payload 구조체 */
+static struct esb_payload tx_payload;
+static struct esb_payload rx_payload; // ACK와 함께 오는 명령 수신용
+
+/* ===== 12-bit Packing 유틸 ===== */
+static inline void pack2x12(uint16_t x, uint16_t y, uint8_t out[3]) {
+    x &= 0x0FFF; y &= 0x0FFF;
+    out[0] = (uint8_t)(x & 0xFF);
+    out[1] = (uint8_t)(((x >> 8) & 0x0F) | ((y & 0x0F) << 4));
+    out[2] = (uint8_t)((y >> 4) & 0xFF);
+}
+
+static uint16_t pack_12bit_stream(const int16_t *in, uint16_t count, uint8_t *out) {
+    if (count & 1) count--; 
+    uint8_t *q = out;
+    for (uint16_t i = 0; i < count; i += 2) {
+        pack2x12(in[i], in[i+1], q);
+        q += 3;
+    }
+    return (count * 3) / 2;
+}
+
+/* ===== WorkQueue: ESB 전송 (ISR 밖에서 실행) ===== */
+static void send_esb_work_handler(struct k_work *work) {
+    // 1. 헤더 생성
+    struct frame_hdr hdr;
+    hdr.magic = sys_cpu_to_le16(FRAME_MAGIC);
+    hdr.seq   = sys_cpu_to_le16(packet_seq++);
+    hdr.ch_mask = 0x0F;
+    hdr.flags = FLAG_PACKED12;
+
+    // 2. 데이터 패킹 (12-bit)
+    // 헤더(8바이트) 뒤에 데이터 붙임
+    uint8_t *data_ptr = &tx_payload.data[sizeof(struct frame_hdr)];
+    uint16_t data_len = pack_12bit_stream(tx_buffer, SAMPLES_PER_CHUNK * NUM_CHANNELS, data_ptr);
+
+    // 3. 헤더 길이 정보 업데이트 및 복사
+    hdr.payload_len = sys_cpu_to_le16(data_len);
+    memcpy(tx_payload.data, &hdr, sizeof(hdr));
+
+    // 4. ESB 전송 (Pipe 0)
+    tx_payload.length = sizeof(hdr) + data_len;
+    tx_payload.pipe = 0;
+    
+    int err = esb_write_payload(&tx_payload);
+    if (err) {
+        // 전송 실패 (RX가 없거나 깨짐) -> LED 등으로 표시 가능
+    }
+}
+K_WORK_DEFINE(esb_work, send_esb_work_handler);
+
+/* ===== 타이머 핸들러 (정확한 200us 샘플링) ===== */
+void adc_timer_handler(struct k_timer *dummy) {
+    if (!streaming_enabled) return;
+
+    // 1. ADC 읽기 (Blocking이지만 빠름)
+    adc_read(adc_dev, &sequence);
+
+    // 2. 버퍼에 저장
+    for (int i = 0; i < NUM_CHANNELS; i++) {
+        tx_buffer[tx_buf_idx * NUM_CHANNELS + i] = raw_sample_buf[i];
+    }
+    tx_buf_idx++;
+
+    // 3. 20개 다 찼으면 전송 예약
+    if (tx_buf_idx >= SAMPLES_PER_CHUNK) {
+        tx_buf_idx = 0;
+        k_work_submit(&esb_work);
+    }
+}
+K_TIMER_DEFINE(sample_timer, adc_timer_handler, NULL);
+
+/* ===== ESB 이벤트 핸들러 (ACK 수신 확인) ===== */
+void event_handler(struct esb_evt const *event) {
+    switch (event->evt_id) {
+    case ESB_EVENT_TX_SUCCESS:
+        // ACK와 함께 데이터(명령)가 왔는지 확인
+        if (esb_read_rx_payload(&rx_payload) == 0) {
+            if (rx_payload.length > 0) {
+                // "on" or "off" check
+                if (strncmp((char *)rx_payload.data, "on", 2) == 0) {
+                    streaming_enabled = true;
+                    tx_buf_idx = 0;
+                } else if (strncmp((char *)rx_payload.data, "off", 3) == 0) {
+                    streaming_enabled = false;
+                }
+            }
+        }
+        break;
+    default: break;
+    }
+}
+
+/* ===== Main ===== */
+int main(void) {
+    // 1. ADC Init
+    for (int i = 0; i < NUM_CHANNELS; i++) {
+        struct adc_channel_cfg cfg = {
+            .gain = ADC_GAIN_1_6,
+            .reference = ADC_REF_VDD_1_4,
+            .acquisition_time = ADC_ACQ_TIME_DEFAULT,
+            .channel_id = channel_ids[i],
+            .input_positive = channel_ids[i] + 1, // AIN mapping
+        };
+        adc_channel_setup(adc_dev, &cfg);
+        sequence.channels |= BIT(channel_ids[i]);
+    }
+
+    // 2. ESB Init (PTX Role)
+    struct esb_config config = ESB_DEFAULT_CONFIG;
+    config.protocol = ESB_PROTOCOL_ESB_DPL;
+    config.mode = ESB_MODE_PTX;
+    config.event_handler = event_handler;
+    config.bitrate = ESB_BITRATE_2MBPS;
+    config.crc = ESB_CRC_16BIT;
+    config.tx_output_power = ESB_TX_POWER_4DBM;
+    esb_init(&config);
+    esb_write_payload(&tx_payload); // Dummy write to start logic
+
+    // 3. Timer Start
+    // 기본적으로 켜둠 (PC에서 off 보내면 멈춤)
+    streaming_enabled = true; 
+    k_timer_start(&sample_timer, K_USEC(SAMPLING_INTERVAL_US), K_USEC(SAMPLING_INTERVAL_US));
+
+    printk("ESB TX Started (200us Timer Mode)\n");
+    return 0;
+}
